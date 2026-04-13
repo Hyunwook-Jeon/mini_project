@@ -6,6 +6,7 @@ Doosan `E0509` 로봇과 Intel RealSense 카메라를 이용해 객체를 인식
 
 - `object_detector`: RGB-D 이미지에서 물체를 검출하고 로봇 베이스 좌표계 기준 위치를 발행
 - `pick_place_node`: 검출된 물체 좌표를 받아 Pick & Place 상태머신 수행
+- `gui_node`: 카메라 영상과 검출 물체 버튼을 보여 주고, 사용자가 집을 물체를 선택
 
 ## 주요 구성
 
@@ -22,6 +23,10 @@ Doosan `E0509` 로봇과 Intel RealSense 카메라를 이용해 객체를 인식
   - TF를 이용한 카메라 좌표계 → 로봇 베이스 좌표계 변환
 - `dsr_realsense_pick_place/pick_place_node.py`
   - IDLE → DETECTING → PRE_PICK → PICK → LIFT → MOVE_TO_PLACE → PLACE → HOME
+- `dsr_realsense_pick_place/gui_node.py`
+  - PyQt5 GUI
+  - 물체 선택 버튼
+  - 현재 상태 표시
 
 ## 요구 환경
 
@@ -62,7 +67,7 @@ sudo apt install -y ros-humble-realsense2-camera
 
 ```bash
 sudo apt update
-sudo apt install -y python3-numpy python3-opencv
+sudo apt install -y python3-numpy python3-opencv python3-pyqt5
 pip install ultralytics
 ```
 
@@ -138,11 +143,21 @@ source install/setup.bash
 
 ## 실행 방법
 
+기본 launch 에서는 GUI 가 함께 실행됩니다.
+RViz 는 `dsr_bringup2_moveit.launch.py` 내부에서 이미 실행되므로 이 launch 에서는 별도로 한 번 더 띄우지 않습니다.
+
+Wayland 환경에서 RViz 또는 GUI 가 안 뜨면 아래처럼 `xcb`를 먼저 지정하고 실행하는 것을 권장합니다.
+
+```bash
+export QT_QPA_PLATFORM=xcb
+```
+
 ### 1. 가상 모드
 
 ```bash
 cd ~/ros2_ws
 source install/setup.bash
+export QT_QPA_PLATFORM=xcb
 ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=virtual
 ```
 
@@ -151,6 +166,7 @@ ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=virtual
 ```bash
 cd ~/ros2_ws
 source install/setup.bash
+export QT_QPA_PLATFORM=xcb
 ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real host:=192.168.1.100
 ```
 
@@ -159,7 +175,17 @@ ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real host:=192.1
 ```bash
 cd ~/ros2_ws
 source install/setup.bash
-ros2 launch dsr_realsense_pick_place pick_place.launch.py use_realsense:=false rviz:=false
+export QT_QPA_PLATFORM=xcb
+ros2 launch dsr_realsense_pick_place pick_place.launch.py use_realsense:=false
+```
+
+### 4. GUI 없이 실행
+
+```bash
+cd ~/ros2_ws
+source install/setup.bash
+export QT_QPA_PLATFORM=xcb
+ros2 launch dsr_realsense_pick_place pick_place.launch.py gui:=false
 ```
 
 ## 설정 포인트
@@ -202,6 +228,28 @@ RealSense launch 설정과 토픽 이름이 다르면 반드시 맞춰야 합니
 - `gripper_wait_sec`
 
 실제 배선과 IO 번호에 맞게 수정해야 합니다.
+
+### 5. GUI 선택 토픽
+
+- GUI 는 `/selected_object_label` 토픽으로 선택한 물체 라벨을 보냅니다.
+- `object_detector`는 그 라벨에 맞는 물체 좌표를 `/selected_object_pose`로 발행합니다.
+- `pick_place_node`는 그 좌표만 받아서 pick 동작을 수행합니다.
+
+### 6. 선택 흐름 확인 방법
+
+아래 토픽을 보면 GUI 선택이 실제 pick 동작까지 연결되는지 확인할 수 있습니다.
+
+```bash
+ros2 topic echo /selected_object_label
+ros2 topic echo /selected_object_pose
+ros2 topic echo /pick_place_state
+```
+
+확인 순서:
+
+1. GUI 버튼을 누르면 `/selected_object_label` 값이 바뀌는지 확인
+2. 선택한 물체가 화면에 보이면 `/selected_object_pose`가 발행되는지 확인
+3. `pick_place_state`가 `DETECTING -> PRE_PICK -> PICK ...` 순서로 바뀌는지 확인
 
 ## YOLO 사용 관련
 

@@ -27,6 +27,7 @@ object_detector:
     min_depth_m: 0.15               # 최소 유효 깊이 (m)
     max_depth_m: 1.5                # 최대 유효 깊이 (m)
     depth_sample_radius: 5          # depth 샘플링 반경 (픽셀)
+    selected_object_topic: "/selected_object_label"
 
 pick_place_node:
   ros__parameters:
@@ -69,3 +70,4 @@ pick_place_node:
     workspace_y_max: 0.60
     workspace_z_min: 0.0
     workspace_z_max: 0.60
+    target_pose_topic: "/selected_object_pose"

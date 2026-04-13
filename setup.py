@@ -29,6 +29,7 @@ setup(
             # ros2 run 으로 실행할 엔트리포인트 등록
             'object_detector = dsr_realsense_pick_place.object_detector:main',
             'pick_place_node = dsr_realsense_pick_place.pick_place_node:main',
+            'gui_node = dsr_realsense_pick_place.gui_node:main',
         ],
     },
 )

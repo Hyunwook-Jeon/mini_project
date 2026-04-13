@@ -7,7 +7,7 @@ pick_place.launch.py
   3. 카메라→로봇 정적 TF
   4. 객체 검출 노드
   5. Pick & Place 상태머신 노드
-  6. RViz (선택)
+  6. GUI (선택)
 
 사용법:
   # 가상 모드 (에뮬레이터)
@@ -66,8 +66,8 @@ ARGUMENTS = [
     DeclareLaunchArgument('cam_tf_qz', default_value='0.0'),
     DeclareLaunchArgument('cam_tf_qw', default_value='0.707'),
     # 기타
-    DeclareLaunchArgument('rviz', default_value='true',
-                          description='RViz 실행 여부'),
+    DeclareLaunchArgument('gui', default_value='true',
+                          description='PyQt GUI 실행 여부'),
 ]
 
 
@@ -144,6 +144,15 @@ def generate_launch_description():
         parameters=[params_file],
     )
 
+    gui_node = Node(
+        package='dsr_realsense_pick_place',
+        executable='gui_node',
+        name='pick_place_gui',
+        output='screen',
+        parameters=[params_file],
+        condition=IfCondition(LaunchConfiguration('gui')),
+    )
+
     # ── 5. Pick & Place 노드 (로봇 bringup 후 5초 지연 시작) ──────────
     pick_place = TimerAction(
         period=5.0,
@@ -159,21 +168,12 @@ def generate_launch_description():
         ]
     )
 
-    # ── 6. RViz ───────────────────────────────────────────────────────
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('rviz')),
-    )
-
     # 최종 LaunchDescription 에 각 액션을 순서대로 담아 반환한다.
     return LaunchDescription(ARGUMENTS + [
         doosan_moveit,
         realsense_node,
         static_tf_cam_to_base,
         object_detector,
+        gui_node,
         pick_place,
-        rviz_node,
     ])

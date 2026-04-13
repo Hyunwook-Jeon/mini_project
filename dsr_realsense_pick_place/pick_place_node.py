@@ -7,7 +7,7 @@ Doosan E0509 Pick & Place 상태머신 노드.
   IDLE → DETECTING → PRE_PICK → PICK → LIFT → MOVE_TO_PLACE → PLACE → HOME → IDLE
 
 구독:
-  /detected_object_pose  (geometry_msgs/PoseStamped)
+  /selected_object_pose  (geometry_msgs/PoseStamped)
 
 Doosan 서비스 (namespace: /dsr01/):
   motion/move_joint      (dsr_msgs2/MoveJoint)
@@ -69,6 +69,7 @@ class PickPlaceNode(Node):
         self.declare_parameter('workspace_y_max', 0.60)
         self.declare_parameter('workspace_z_min', 0.0)
         self.declare_parameter('workspace_z_max', 0.60)
+        self.declare_parameter('target_pose_topic', '/selected_object_pose')
 
         ns = self.get_parameter('robot_namespace').value
         # 이후 계산과 서비스 요청에서 바로 쓰도록 멤버 변수로 저장한다.
@@ -119,7 +120,7 @@ class PickPlaceNode(Node):
         self.pub_state = self.create_publisher(String, '/pick_place_state', 10)
 
         # ── 구독: 검출된 객체 포즈 ──────────────────────────────────────
-        self.create_subscription(PoseStamped, '/detected_object_pose',
+        self.create_subscription(PoseStamped, self.get_parameter('target_pose_topic').value,
                                  self._cb_pose, 10)
 
         # ── 상태머신 스레드 ─────────────────────────────────────────────

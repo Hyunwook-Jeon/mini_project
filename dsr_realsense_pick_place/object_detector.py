@@ -9,9 +9,13 @@ RealSense RGB-D + YOLOv8 기반 객체 검출 노드.
   /camera/color/camera_info        (sensor_msgs/CameraInfo)
 
 발행:
-  /detected_object_pose            (geometry_msgs/PoseStamped) - 로봇 베이스 프레임 기준
+  /detected_object_pose            (geometry_msgs/PoseStamped) - 선택된 물체의 로봇 베이스 좌표
+  /selected_object_pose            (geometry_msgs/PoseStamped) - GUI가 선택한 물체의 좌표
+  /detected_objects                (std_msgs/String)           - 검출 물체 목록(JSON)
   /detection_debug_image           (sensor_msgs/Image)         - 디버그 시각화
 """
+
+import json
 
 import rclpy
 from rclpy.node import Node
@@ -20,7 +24,8 @@ import numpy as np
 import cv2
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseStamped, PointStamped
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import tf2_ros
@@ -46,6 +51,7 @@ class ObjectDetectorNode(Node):
         self.declare_parameter('min_depth_m', 0.15)
         self.declare_parameter('max_depth_m', 1.5)
         self.declare_parameter('depth_sample_radius', 5)
+        self.declare_parameter('selected_object_topic', '/selected_object_label')
 
         p = self.get_parameter
         # 자주 쓰는 파라미터는 멤버 변수로 꺼내 두고 이후 계산에 재사용한다.
@@ -58,6 +64,8 @@ class ObjectDetectorNode(Node):
         self.min_depth = p('min_depth_m').value
         self.max_depth = p('max_depth_m').value
         self.depth_r = p('depth_sample_radius').value
+        self.selected_object_label = ''
+        self.last_logged_selected_label = None
 
         # ── 카메라 내부 파라미터 (camera_info 수신 전까지 None) ─────────
         self.fx = self.fy = self.cx = self.cy = None
@@ -92,10 +100,15 @@ class ObjectDetectorNode(Node):
                                  self._cb_depth, sensor_qos)
         self.create_subscription(CameraInfo, p('camera_info_topic').value,
                                  self._cb_camera_info, sensor_qos)
+        self.create_subscription(String, p('selected_object_topic').value,
+                                 self._cb_selected_object, 10)
 
         # ── 발행 ────────────────────────────────────────────────────────
         self.pub_pose = self.create_publisher(PoseStamped,
                                               '/detected_object_pose', 10)
+        self.pub_selected_pose = self.create_publisher(PoseStamped,
+                                                       '/selected_object_pose', 10)
+        self.pub_objects = self.create_publisher(String, '/detected_objects', 10)
         self.pub_debug = self.create_publisher(Image,
                                                '/detection_debug_image', 10)
 
@@ -144,6 +157,14 @@ class ObjectDetectorNode(Node):
         self.cx = msg.k[2]
         self.cy = msg.k[5]
 
+    def _cb_selected_object(self, msg: String):
+        # 빈 문자열이면 자동 선택 모드로 간주한다.
+        self.selected_object_label = msg.data.strip()
+        if self.selected_object_label != self.last_logged_selected_label:
+            label_text = self.selected_object_label if self.selected_object_label else '자동 선택'
+            self.get_logger().info(f'선택 물체 변경: {label_text}')
+            self.last_logged_selected_label = self.selected_object_label
+
     # ────────────────────────────────────────────────────────────────────
     # 메인 검출 루프
     # ────────────────────────────────────────────────────────────────────
@@ -171,9 +192,7 @@ class ObjectDetectorNode(Node):
                       else self._detect_color(color_img))
 
         debug_img = color_img.copy()
-        # 여러 물체가 잡히면 우선 가장 가까운 물체를 pick 대상으로 사용한다.
-        best = None           # (u, v, depth_m, label)
-        best_depth = float('inf')
+        candidates = []
 
         for u, v, w, h, label, conf in detections:
             # bbox 중심 주변의 depth 중앙값을 쓰면 단일 픽셀보다 노이즈에 강하다.
@@ -201,27 +220,43 @@ class ObjectDetectorNode(Node):
                         (u - w // 2, v - h // 2 - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            if depth_m < best_depth:
-                best_depth = depth_m
-                best = (u, v, depth_m, label)
+            pose_cam = self._pixel_to_camera_pose(u, v, depth_m)
+            pose_base = self._transform_to_base(pose_cam)
+            if pose_base is None:
+                continue
+
+            pos = pose_base.pose.position
+            candidates.append({
+                'label': label,
+                'confidence': conf,
+                'depth_m': depth_m,
+                'pixel_u': u,
+                'pixel_v': v,
+                'pose': pose_base,
+                'pose_dict': {
+                    'x': pos.x,
+                    'y': pos.y,
+                    'z': pos.z,
+                },
+            })
+
+        self._publish_detected_objects(candidates)
 
         self.pub_debug.publish(
             self.bridge.cv2_to_imgmsg(debug_img, 'bgr8'))
 
-        if best is None:
+        selected = self._choose_target(candidates)
+        if selected is None:
             return
 
-        u, v, depth_m, label = best
-        # 2D 픽셀 좌표 + depth 를 3D 좌표로 바꾼 뒤, 로봇 기준 좌표로 변환한다.
-        pose_cam = self._pixel_to_camera_pose(u, v, depth_m)
-        pose_base = self._transform_to_base(pose_cam)
-        if pose_base is not None:
-            self.pub_pose.publish(pose_base)
-            pos = pose_base.pose.position
-            self.get_logger().info(
-                f'[{label}] 로봇베이스 좌표: '
-                f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m'
-            )
+        pose_base = selected['pose']
+        pos = pose_base.pose.position
+        self.pub_pose.publish(pose_base)
+        self.pub_selected_pose.publish(pose_base)
+        self.get_logger().info(
+            f'[{selected["label"]}] 로봇베이스 좌표: '
+            f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m'
+        )
 
     # ────────────────────────────────────────────────────────────────────
     # 픽셀 + depth → 카메라 프레임 PoseStamped
@@ -258,6 +293,42 @@ class ObjectDetectorNode(Node):
         except Exception as e:
             self.get_logger().warn(f'TF 변환 실패: {e}')
             return None
+
+    def _publish_detected_objects(self, candidates: list):
+        # GUI 에서 쉽게 읽을 수 있도록 JSON 문자열로 물체 목록을 보낸다.
+        msg = String()
+        msg.data = json.dumps({
+            'selected_label': self.selected_object_label,
+            'objects': [
+                {
+                    'label': item['label'],
+                    'confidence': item['confidence'],
+                    'depth_m': item['depth_m'],
+                    'pixel_u': item['pixel_u'],
+                    'pixel_v': item['pixel_v'],
+                    'pose': item['pose_dict'],
+                }
+                for item in candidates
+            ],
+        })
+        self.pub_objects.publish(msg)
+
+    def _choose_target(self, candidates: list):
+        # 선택한 라벨이 있으면 그 라벨 중 가장 가까운 물체를 사용한다.
+        filtered = candidates
+        if self.selected_object_label:
+            filtered = [
+                item for item in candidates
+                if item['label'] == self.selected_object_label
+            ]
+        if not filtered:
+            if self.selected_object_label:
+                self.get_logger().warn(
+                    f'선택한 물체({self.selected_object_label})가 현재 화면에서 검출되지 않음',
+                    throttle_duration_sec=2.0
+                )
+            return None
+        return min(filtered, key=lambda item: item['depth_m'])
 
     # ────────────────────────────────────────────────────────────────────
     # YOLO 검출
