@@ -2,3 +2,4 @@ numpy
 opencv-python
 ultralytics
 PyQt5
+pyrealsense2

@@ -22,9 +22,9 @@ from enum import Enum, auto
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String
+from std_msgs.msg import Int32, String
 
-from dsr_msgs2.srv import MoveJoint, MoveLine, SetCtrlBoxDigitalOutput
+from dsr_msgs2.srv import MoveJoint, MoveLine, SetCtrlBoxDigitalOutput, SetToolDigitalOutput, SerialSendData
 
 
 # ── 상태 정의 ───────────────────────────────────────────────────────────
@@ -53,10 +53,24 @@ class PickPlaceNode(Node):
         self.declare_parameter('cart_vel', 100.0)
         self.declare_parameter('cart_acc', 200.0)
         self.declare_parameter('home_joints', [0.0, 0.0, 90.0, 0.0, 90.0, 0.0])
-        self.declare_parameter('gripper_type', 'digital_io')
+        self.declare_parameter('gripper_type', 'robotis_rh_p12_rn')
         self.declare_parameter('gripper_open_io', 1)
         self.declare_parameter('gripper_close_io', 2)
         self.declare_parameter('gripper_wait_sec', 0.8)
+        self.declare_parameter('tool_digital_open_io', 1)
+        self.declare_parameter('tool_digital_close_io', 2)
+        self.declare_parameter('rh12_serial_service', '/dsr01/gripper/serial_send_data')
+        self.declare_parameter('rh12_bridge_topic', '/gripper/rh12_stroke_cmd')
+        self.declare_parameter('rh12_allow_missing_service', True)
+        self.declare_parameter('rh12_slave_id', 1)
+        self.declare_parameter('rh12_torque_enable_register', 256)
+        self.declare_parameter('rh12_goal_current_register', 275)
+        self.declare_parameter('rh12_stroke_register', 282)
+        self.declare_parameter('rh12_goal_current', 400)
+        self.declare_parameter('rh12_open_stroke', 700)
+        self.declare_parameter('rh12_close_stroke', 0)
+        self.declare_parameter('rh12_port', 1)
+        self.declare_parameter('rh12_init_wait_sec', 0.1)
         self.declare_parameter('pre_pick_z_offset', 0.12)
         self.declare_parameter('pick_z_offset', 0.005)
         self.declare_parameter('grasp_rpy', [0.0, 180.0, 0.0])
@@ -82,6 +96,20 @@ class PickPlaceNode(Node):
         self.io_open = self.get_parameter('gripper_open_io').value
         self.io_close = self.get_parameter('gripper_close_io').value
         self.gripper_wait = self.get_parameter('gripper_wait_sec').value
+        self.tool_io_open = self.get_parameter('tool_digital_open_io').value
+        self.tool_io_close = self.get_parameter('tool_digital_close_io').value
+        self.rh12_serial_service = self.get_parameter('rh12_serial_service').value
+        self.rh12_bridge_topic = self.get_parameter('rh12_bridge_topic').value
+        self.rh12_allow_missing_service = self.get_parameter('rh12_allow_missing_service').value
+        self.rh12_slave_id = self.get_parameter('rh12_slave_id').value
+        self.rh12_torque_enable_register = self.get_parameter('rh12_torque_enable_register').value
+        self.rh12_goal_current_register = self.get_parameter('rh12_goal_current_register').value
+        self.rh12_stroke_register = self.get_parameter('rh12_stroke_register').value
+        self.rh12_goal_current = self.get_parameter('rh12_goal_current').value
+        self.rh12_open_stroke = self.get_parameter('rh12_open_stroke').value
+        self.rh12_close_stroke = self.get_parameter('rh12_close_stroke').value
+        self.rh12_port = self.get_parameter('rh12_port').value
+        self.rh12_init_wait = self.get_parameter('rh12_init_wait_sec').value
         self.pre_pick_dz = self.get_parameter('pre_pick_z_offset').value
         self.pick_dz = self.get_parameter('pick_z_offset').value
         self.grasp_rpy = self.get_parameter('grasp_rpy').value
@@ -107,6 +135,11 @@ class PickPlaceNode(Node):
         self.cli_dout = self.create_client(
             SetCtrlBoxDigitalOutput,
             f'/{ns}/io/set_ctrl_box_digital_output')
+        self.cli_tool_dout = self.create_client(
+            SetToolDigitalOutput,
+            f'/{ns}/io/set_tool_digital_output')
+        self.cli_serial_send = self.create_client(
+            SerialSendData, self.rh12_serial_service)
 
         self._wait_for_services()
 
@@ -115,9 +148,14 @@ class PickPlaceNode(Node):
         self.state = State.IDLE
         self.state_lock = threading.Lock()
         self.target_pose: PoseStamped | None = None
+        self.rh12_initialized = False
+        self.rh12_lock = threading.Lock()
 
         # ── 발행: 현재 상태 표시 ────────────────────────────────────────
         self.pub_state = self.create_publisher(String, '/pick_place_state', 10)
+        # RH-P12-Rn 서비스 브리지가 아직 없을 때를 대비해 stroke 명령을 토픽으로도 내보낸다.
+        self.pub_rh12_stroke = self.create_publisher(
+            Int32, self.rh12_bridge_topic, 10)
 
         # ── 구독: 검출된 객체 포즈 ──────────────────────────────────────
         self.create_subscription(PoseStamped, self.get_parameter('target_pose_topic').value,
@@ -134,11 +172,24 @@ class PickPlaceNode(Node):
     # 서비스 대기
     # ────────────────────────────────────────────────────────────────────
     def _wait_for_services(self):
-        for cli, name in [
+        required_services = [
             (self.cli_movej, 'move_joint'),
             (self.cli_movel, 'move_line'),
             (self.cli_dout, 'set_ctrl_box_digital_output'),
-        ]:
+        ]
+
+        if self.gripper_type == 'tool_digital':
+            required_services.append((self.cli_tool_dout, 'set_tool_digital_output'))
+        elif self.gripper_type == 'robotis_rh_p12_rn':
+            if self.rh12_allow_missing_service:
+                self.get_logger().warn(
+                    f'{self.rh12_serial_service} 서비스가 없어도 계속 진행합니다. '
+                    f'대신 {self.rh12_bridge_topic} 토픽으로 stroke 명령을 발행합니다.'
+                )
+            else:
+                required_services.append((self.cli_serial_send, self.rh12_serial_service))
+
+        for cli, name in required_services:
             self.get_logger().info(f'서비스 대기 중: {name} ...')
             while not cli.wait_for_service(timeout_sec=2.0):
                 self.get_logger().warn(f'{name} 서비스 없음, 재시도...')
@@ -336,15 +387,30 @@ class PickPlaceNode(Node):
     # ────────────────────────────────────────────────────────────────────
     def _gripper_open(self):
         self.get_logger().info('그리퍼 열기')
-        # Doosan Digital Output: value=0 → ON(Active), value=1 → OFF
-        self._set_digital_output(self.io_open, active=True)
-        self._set_digital_output(self.io_close, active=False)
+        if self.gripper_type == 'digital_io':
+            self._set_digital_output(self.io_open, active=True)
+            self._set_digital_output(self.io_close, active=False)
+        elif self.gripper_type == 'tool_digital':
+            self._set_tool_digital_output(self.tool_io_open, active=True)
+            self._set_tool_digital_output(self.tool_io_close, active=False)
+        elif self.gripper_type == 'robotis_rh_p12_rn':
+            self._rh12_move(self.rh12_open_stroke)
+        else:
+            self.get_logger().warn(f'지원하지 않는 gripper_type: {self.gripper_type}')
         time.sleep(self.gripper_wait)
 
     def _gripper_close(self):
         self.get_logger().info('그리퍼 닫기')
-        self._set_digital_output(self.io_open, active=False)
-        self._set_digital_output(self.io_close, active=True)
+        if self.gripper_type == 'digital_io':
+            self._set_digital_output(self.io_open, active=False)
+            self._set_digital_output(self.io_close, active=True)
+        elif self.gripper_type == 'tool_digital':
+            self._set_tool_digital_output(self.tool_io_open, active=False)
+            self._set_tool_digital_output(self.tool_io_close, active=True)
+        elif self.gripper_type == 'robotis_rh_p12_rn':
+            self._rh12_move(self.rh12_close_stroke)
+        else:
+            self.get_logger().warn(f'지원하지 않는 gripper_type: {self.gripper_type}')
         time.sleep(self.gripper_wait)
 
     def _set_digital_output(self, port: int, active: bool):
@@ -357,6 +423,125 @@ class PickPlaceNode(Node):
                                f'digital_output(port={port},val={active})')
         except Exception as e:
             self.get_logger().warn(f'Digital Output 오류: {e}')
+
+    def _set_tool_digital_output(self, port: int, active: bool):
+        # 툴 플랜지 디지털 출력으로 그리퍼 open/close 신호를 보낸다.
+        req = SetToolDigitalOutput.Request()
+        req.index = port
+        req.value = 0 if active else 1  # 0=ON, 1=OFF (active low)
+        try:
+            self._call_service(self.cli_tool_dout, req,
+                               f'tool_digital_output(port={port},val={active})')
+        except Exception as e:
+            self.get_logger().warn(f'Tool Digital Output 오류: {e}')
+
+    def _rh12_move(self, stroke: int):
+        stroke = max(0, min(700, int(stroke)))
+        with self.rh12_lock:
+            if self.cli_serial_send.service_is_ready():
+                self._ensure_rh12_initialized()
+
+                # RH-P12-Rn 은 예시 패키지와 같은 방식으로 FC16 stroke 명령을 보낸다.
+                payload = self._modbus_fc16(
+                    slave_id=self.rh12_slave_id,
+                    start_register=self.rh12_stroke_register,
+                    values=[stroke, 0],
+                )
+                req = SerialSendData.Request()
+                # srv 타입이 string 이라 raw bytes 를 latin-1 문자열로 그대로 실어 보낸다.
+                req.data = payload.decode('latin-1')
+                self.get_logger().info(
+                    f'RH-P12-Rn serial 서비스 전송: stroke={stroke}, frame={payload.hex()}'
+                )
+                try:
+                    self._call_service(self.cli_serial_send, req,
+                                       f'rh12_serial_send(stroke={stroke})')
+                    return
+                except Exception as e:
+                    self.get_logger().warn(f'RH-P12-Rn SerialSendData 오류: {e}')
+
+            payload = self._modbus_fc16(
+                slave_id=self.rh12_slave_id,
+                start_register=self.rh12_stroke_register,
+                values=[stroke, 0],
+            )
+
+        msg = Int32()
+        msg.data = stroke
+        self.pub_rh12_stroke.publish(msg)
+        self.get_logger().warn(
+            f'RH-P12-Rn serial 서비스가 준비되지 않아 bridge 토픽으로 대체 발행: '
+            f'stroke={stroke}, topic={self.rh12_bridge_topic}, frame={payload.hex()}'
+        )
+
+    def _ensure_rh12_initialized(self):
+        if self.rh12_initialized:
+            return
+
+        # 강사님 예시처럼 torque enable, goal current를 먼저 넣고 stroke 명령을 보낸다.
+        self._rh12_send_frame(
+            self._modbus_fc06(
+                slave_id=self.rh12_slave_id,
+                register=self.rh12_torque_enable_register,
+                value=1,
+            ),
+            'rh12_torque_enable',
+        )
+        time.sleep(self.rh12_init_wait)
+        self._rh12_send_frame(
+            self._modbus_fc06(
+                slave_id=self.rh12_slave_id,
+                register=self.rh12_goal_current_register,
+                value=self.rh12_goal_current,
+            ),
+            'rh12_goal_current',
+        )
+        time.sleep(self.rh12_init_wait)
+        self.rh12_initialized = True
+        self.get_logger().info('RH-P12-Rn 초기화 완료')
+
+    def _rh12_send_frame(self, payload: bytes, name: str):
+        req = SerialSendData.Request()
+        req.data = payload.decode('latin-1')
+        self.get_logger().info(f'RH-P12-Rn frame 전송: {name}, frame={payload.hex()}')
+        self._call_service(self.cli_serial_send, req, name)
+
+    def _modbus_fc06(self, slave_id: int, register: int, value: int) -> bytes:
+        frame = bytearray()
+        frame.append(slave_id & 0xFF)
+        frame.append(0x06)  # FC06 = Write Single Register
+        frame.extend(int(register).to_bytes(2, byteorder='big', signed=False))
+        frame.extend(int(value).to_bytes(2, byteorder='big', signed=False))
+        crc = self._modbus_crc16(frame)
+        frame.extend(crc.to_bytes(2, byteorder='little', signed=False))
+        return bytes(frame)
+
+    def _modbus_fc16(self, slave_id: int, start_register: int, values: list[int]) -> bytes:
+        # DART의 modbus_fc16(282, 2, 2, [stroke, 0]) 형태를 ROS2에서 재현한다.
+        register_count = len(values)
+        byte_count = register_count * 2
+        frame = bytearray()
+        frame.append(slave_id & 0xFF)
+        frame.append(0x10)  # FC16 = Write Multiple Registers
+        frame.extend(start_register.to_bytes(2, byteorder='big', signed=False))
+        frame.extend(register_count.to_bytes(2, byteorder='big', signed=False))
+        frame.append(byte_count & 0xFF)
+        for value in values:
+            frame.extend(int(value).to_bytes(2, byteorder='big', signed=False))
+        crc = self._modbus_crc16(frame)
+        frame.extend(crc.to_bytes(2, byteorder='little', signed=False))
+        return bytes(frame)
+
+    def _modbus_crc16(self, data: bytes) -> int:
+        crc = 0xFFFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x0001:
+                    crc = (crc >> 1) ^ 0xA001
+                else:
+                    crc >>= 1
+        return crc & 0xFFFF
 
 
 def main(args=None):

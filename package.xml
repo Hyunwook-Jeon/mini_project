@@ -16,6 +16,7 @@
   <depend>launch_ros</depend>
   <depend>ament_index_python</depend>
   <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>dsr_msgs2</depend>

@@ -22,12 +22,13 @@ from rclpy.node import Node
 import rclpy.duration
 import numpy as np
 import cv2
+import pyrealsense2 as rs
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
-from cv_bridge import CvBridge
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from cv_bridge import CvBridge, CvBridgeError
+import message_filters
 import tf2_ros
 import tf2_geometry_msgs  # noqa: F401  (transform 메서드 등록용)
 
@@ -51,6 +52,8 @@ class ObjectDetectorNode(Node):
         self.declare_parameter('min_depth_m', 0.15)
         self.declare_parameter('max_depth_m', 1.5)
         self.declare_parameter('depth_sample_radius', 5)
+        self.declare_parameter('depth_center_ratio', 0.6)
+        self.declare_parameter('depth_outlier_mad_scale', 2.5)
         self.declare_parameter('selected_object_topic', '/selected_object_label')
 
         p = self.get_parameter
@@ -64,11 +67,13 @@ class ObjectDetectorNode(Node):
         self.min_depth = p('min_depth_m').value
         self.max_depth = p('max_depth_m').value
         self.depth_r = p('depth_sample_radius').value
+        self.depth_center_ratio = p('depth_center_ratio').value
+        self.depth_outlier_mad_scale = p('depth_outlier_mad_scale').value
         self.selected_object_label = ''
         self.last_logged_selected_label = None
 
         # ── 카메라 내부 파라미터 (camera_info 수신 전까지 None) ─────────
-        self.fx = self.fy = self.cx = self.cy = None
+        self.intrinsics = None
 
         # ── YOLO 모델 로드 ───────────────────────────────────────────────
         self.model = None
@@ -83,23 +88,25 @@ class ObjectDetectorNode(Node):
         self.bridge = CvBridge()
 
         # ── 이미지 버퍼 ─────────────────────────────────────────────────
-        self.latest_color = None
-        self.latest_depth = None
-
-        # ── QoS: RealSense는 best_effort로 발행 ─────────────────────────
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
+        self.latest_cv_color = None
+        self.latest_cv_depth_mm = None
 
         # ── 구독 ────────────────────────────────────────────────────────
-        self.create_subscription(Image, p('color_topic').value,
-                                 self._cb_color, sensor_qos)
-        self.create_subscription(Image, p('depth_topic').value,
-                                 self._cb_depth, sensor_qos)
-        self.create_subscription(CameraInfo, p('camera_info_topic').value,
-                                 self._cb_camera_info, sensor_qos)
+        self.color_sub = message_filters.Subscriber(
+            self, Image, p('color_topic').value
+        )
+        self.depth_sub = message_filters.Subscriber(
+            self, Image, p('depth_topic').value
+        )
+        self.info_sub = message_filters.Subscriber(
+            self, CameraInfo, p('camera_info_topic').value
+        )
+        self.ts = message_filters.ApproximateTimeSynchronizer(
+            [self.color_sub, self.depth_sub, self.info_sub],
+            queue_size=10,
+            slop=0.1,
+        )
+        self.ts.registerCallback(self._cb_synced_camera)
         self.create_subscription(String, p('selected_object_topic').value,
                                  self._cb_selected_object, 10)
 
@@ -112,9 +119,7 @@ class ObjectDetectorNode(Node):
         self.pub_debug = self.create_publisher(Image,
                                                '/detection_debug_image', 10)
 
-        # ── 검출 타이머 (10 Hz) ─────────────────────────────────────────
-        self.create_timer(0.1, self._detect_and_publish)
-
+        self.get_logger().info('컬러/뎁스/카메라정보 토픽 동기화 대기 중...')
         self.get_logger().info('ObjectDetectorNode 시작')
 
     # ────────────────────────────────────────────────────────────────────
@@ -143,19 +148,31 @@ class ObjectDetectorNode(Node):
     # ────────────────────────────────────────────────────────────────────
     # 콜백
     # ────────────────────────────────────────────────────────────────────
-    def _cb_color(self, msg):
-        # 최신 프레임만 저장하고, 실제 처리는 타이머 루프에서 수행한다.
-        self.latest_color = msg
+    def _cb_synced_camera(self, color_msg: Image, depth_msg: Image, info_msg: CameraInfo):
+        try:
+            self.latest_cv_color = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
+            self.latest_cv_depth_mm = self.bridge.imgmsg_to_cv2(depth_msg, '16UC1')
+        except CvBridgeError as e:
+            self.get_logger().error(f'CV Bridge 변환 오류: {e}', throttle_duration_sec=3.0)
+            return
 
-    def _cb_depth(self, msg):
-        self.latest_depth = msg
+        if self.intrinsics is None:
+            intr = rs.intrinsics()
+            intr.width = info_msg.width
+            intr.height = info_msg.height
+            intr.ppx = info_msg.k[2]
+            intr.ppy = info_msg.k[5]
+            intr.fx = info_msg.k[0]
+            intr.fy = info_msg.k[4]
+            if info_msg.distortion_model in ('plumb_bob', 'rational_polynomial'):
+                intr.model = rs.distortion.brown_conrady
+            else:
+                intr.model = rs.distortion.none
+            intr.coeffs = list(info_msg.d)
+            self.intrinsics = intr
+            self.get_logger().info('카메라 내장 파라미터(Intrinsics) 수신 완료.')
 
-    def _cb_camera_info(self, msg):
-        # pinhole camera 모델의 내부 파라미터
-        self.fx = msg.k[0]
-        self.fy = msg.k[4]
-        self.cx = msg.k[2]
-        self.cy = msg.k[5]
+        self._detect_and_publish()
 
     def _cb_selected_object(self, msg: String):
         # 빈 문자열이면 자동 선택 모드로 간주한다.
@@ -169,23 +186,15 @@ class ObjectDetectorNode(Node):
     # 메인 검출 루프
     # ────────────────────────────────────────────────────────────────────
     def _detect_and_publish(self):
-        if self.latest_color is None or self.latest_depth is None:
+        if self.latest_cv_color is None or self.latest_cv_depth_mm is None:
             self.get_logger().warn('이미지 미수신 (color or depth None)', throttle_duration_sec=3.0)
             return
-        if self.fx is None:
-            self.get_logger().warn('camera_info 미수신 (fx None)', throttle_duration_sec=3.0)
+        if self.intrinsics is None:
+            self.get_logger().warn('RealSense intrinsics 미수신', throttle_duration_sec=3.0)
             return
 
-        try:
-            color_img = self.bridge.imgmsg_to_cv2(self.latest_color, 'bgr8')
-        except Exception as e:
-            self.get_logger().error(f'cv_bridge 변환 실패: {e}', throttle_duration_sec=3.0)
-            return
-        try:
-            depth_img = self.bridge.imgmsg_to_cv2(self.latest_depth, '16UC1')
-        except Exception as e:
-            self.get_logger().error(f'depth cv_bridge 변환 실패: {e}', throttle_duration_sec=3.0)
-            return
+        color_img = self.latest_cv_color.copy()
+        depth_img = self.latest_cv_depth_mm
 
         # ── 검출 ────────────────────────────────────────────────────────
         detections = (self._detect_yolo(color_img) if self.use_yolo and self.model
@@ -195,19 +204,8 @@ class ObjectDetectorNode(Node):
         candidates = []
 
         for u, v, w, h, label, conf in detections:
-            # bbox 중심 주변의 depth 중앙값을 쓰면 단일 픽셀보다 노이즈에 강하다.
-            r = self.depth_r
-            h_img, w_img = depth_img.shape[:2]
-            roi = depth_img[
-                max(0, v - r):min(h_img, v + r),
-                max(0, u - r):min(w_img, u + r)
-            ]
-            valid = roi[roi > 0]
-            if len(valid) == 0:
-                continue
-
-            depth_m = float(np.median(valid)) * self.depth_scale
-            if not (self.min_depth <= depth_m <= self.max_depth):
+            depth_m = self._estimate_depth_m(depth_img, u, v)
+            if depth_m is None:
                 continue
 
             # 시각화
@@ -258,16 +256,54 @@ class ObjectDetectorNode(Node):
             f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m'
         )
 
+    def _estimate_depth_m(self, depth_img: np.ndarray, u: int, v: int):
+        # bbox 중심 근처 depth를 모아 outlier를 제거한 뒤 대표값을 사용한다.
+        r = max(1, int(self.depth_r))
+        h_img, w_img = depth_img.shape[:2]
+        x0 = max(0, u - r)
+        x1 = min(w_img, u + r + 1)
+        y0 = max(0, v - r)
+        y1 = min(h_img, v + r + 1)
+        roi = depth_img[y0:y1, x0:x1]
+        if roi.size == 0:
+            return None
+
+        yy, xx = np.indices(roi.shape)
+        center_y = v - y0
+        center_x = u - x0
+        dist = np.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
+        max_dist = max(1.0, float(r) * max(0.1, self.depth_center_ratio))
+
+        valid_mask = roi > 0
+        valid_mask &= dist <= max_dist
+        samples = roi[valid_mask].astype(np.float32) * self.depth_scale
+        if samples.size == 0:
+            return None
+
+        samples = samples[(samples >= self.min_depth) & (samples <= self.max_depth)]
+        if samples.size == 0:
+            return None
+
+        median = float(np.median(samples))
+        abs_dev = np.abs(samples - median)
+        mad = float(np.median(abs_dev))
+
+        if mad > 0.0:
+            filtered = samples[abs_dev <= self.depth_outlier_mad_scale * mad]
+            if filtered.size > 0:
+                samples = filtered
+
+        return float(np.median(samples))
+
     # ────────────────────────────────────────────────────────────────────
     # 픽셀 + depth → 카메라 프레임 PoseStamped
     # ────────────────────────────────────────────────────────────────────
     def _pixel_to_camera_pose(self, u: int, v: int, depth_m: float) -> PoseStamped:
-        # pinhole 모델:
-        #   X = (u - cx) * Z / fx
-        #   Y = (v - cy) * Z / fy
-        X = (u - self.cx) * depth_m / self.fx
-        Y = (v - self.cy) * depth_m / self.fy
-        Z = depth_m
+        X, Y, Z = rs.rs2_deproject_pixel_to_point(
+            self.intrinsics,
+            [float(u), float(v)],
+            float(depth_m),
+        )
 
         ps = PoseStamped()
         ps.header.frame_id = self.camera_frame
