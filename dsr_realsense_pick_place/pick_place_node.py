@@ -3,16 +3,37 @@ pick_place_node.py
 ------------------
 Doosan E0509 Pick & Place 상태머신 노드.
 
-흐름:
-  IDLE → DETECTING → PRE_PICK → PICK → LIFT → MOVE_TO_PLACE → PLACE → HOME → IDLE
+상태 전이 흐름:
+  IDLE
+    → DETECTING      : 홈 이동 완료 후 물체 좌표 수신 대기
+    → PRE_PICK        : 작업 영역 유효 검증 후 물체 위 안전 높이까지 이동
+    → PICK            : 저속으로 파지 높이까지 하강 → 그리퍼 닫기
+    → LIFT            : 파지 후 안전 높이로 상승
+    → MOVE_TO_PLACE   : Place 위치 상단으로 이동
+    → PLACE           : 저속으로 Place 높이까지 하강 → 그리퍼 열기
+    → POST_PLACE      : Place 위치 상단으로 복귀
+    → HOME            : 홈 포지션으로 이동
+    → IDLE (반복)
+    → ERROR          : 예외 발생 시 수동 복구 대기
 
 구독:
-  /selected_object_pose  (geometry_msgs/PoseStamped)
+  /selected_object_pose  (geometry_msgs/PoseStamped)  - object_detector가 발행하는 타겟 좌표
 
-Doosan 서비스 (namespace: /dsr01/):
-  motion/move_joint      (dsr_msgs2/MoveJoint)
-  motion/move_line       (dsr_msgs2/MoveLine)
-  io/set_ctrl_box_digital_output  (dsr_msgs2/SetCtrlBoxDigitalOutput)
+발행:
+  /pick_place_state      (std_msgs/String)             - 현재 상태 이름 (모니터링용)
+  /gripper/rh12_stroke_cmd (std_msgs/Int32)            - RH-P12-Rn 서비스 미사용 시 브리지 토픽
+
+Doosan 서비스 클라이언트 (namespace: /dsr01/):
+  motion/move_joint                  (dsr_msgs2/MoveJoint)
+  motion/move_line                   (dsr_msgs2/MoveLine)
+  io/set_ctrl_box_digital_output     (dsr_msgs2/SetCtrlBoxDigitalOutput)
+  io/set_tool_digital_output         (dsr_msgs2/SetToolDigitalOutput)
+  gripper/serial_send_data           (dsr_msgs2/SerialSendData)  [RH-P12-Rn 전용]
+
+지원 그리퍼:
+  digital_io        : 컨트롤 박스 디지털 출력 (relay 방식)
+  tool_digital      : 툴 플랜지 디지털 출력
+  robotis_rh_p12_rn : ROBOTIS RH-P12-Rn (Modbus RTU over serial)
 """
 
 import threading
@@ -29,6 +50,22 @@ from dsr_msgs2.srv import MoveJoint, MoveLine, SetCtrlBoxDigitalOutput, SetToolD
 
 # ── 상태 정의 ───────────────────────────────────────────────────────────
 class State(Enum):
+    """Pick & Place 작업 단계를 나타내는 상태 열거형.
+
+    각 상태의 역할:
+      IDLE          : 초기 상태. 시작 시 홈으로 이동한 뒤 DETECTING으로 전환.
+      DETECTING     : /selected_object_pose 토픽에서 유효한 타겟 좌표를 기다리는 상태.
+                      포즈 콜백(_cb_pose)에서 작업 영역 검증 후 PRE_PICK으로 전환.
+      PRE_PICK      : 물체 위 pre_pick_z_offset(기본 0.12m) 높이까지 이동.
+                      그리퍼를 미리 열고 접근해 충돌을 예방.
+      PICK          : 저속(50mm/s)으로 pick_z_offset(기본 0.005m) 높이까지 하강 후 그리퍼 닫기.
+      LIFT          : 파지 후 PRE_PICK 높이까지 다시 상승. 주변 장애물 회피.
+      MOVE_TO_PLACE : place_position 상단(pre_place_z_offset) 으로 수평 이동.
+      PLACE         : 저속으로 place_position까지 하강 후 그리퍼 열기.
+      POST_PLACE    : 그리퍼 오픈 후 place 위 안전 높이로 복귀.
+      HOME          : 홈 관절 각도로 복귀. 다음 사이클 준비.
+      ERROR         : 예외 발생 시 진입. 2초 간격으로 대기하며 수동 복구 안내.
+    """
     IDLE          = auto()
     DETECTING     = auto()
     PRE_PICK      = auto()
@@ -144,11 +181,15 @@ class PickPlaceNode(Node):
         self._wait_for_services()
 
         # ── 상태 변수 ───────────────────────────────────────────────────
-        # 상태머신은 별도 스레드에서 돌기 때문에 lock 으로 상태 접근을 보호한다.
+        # 상태머신 스레드와 ROS 콜백 스레드가 state/target_pose를 동시에 접근하므로
+        # threading.Lock()으로 보호한다. Lock 없이 접근하면 데이터 경쟁(race condition) 발생.
         self.state = State.IDLE
         self.state_lock = threading.Lock()
+        # target_pose: 가장 최근에 수신한 타겟 위치. DETECTING 상태에서만 갱신.
         self.target_pose: PoseStamped | None = None
+        # rh12_initialized: Torque Enable, Goal Current 초기화를 최초 1회만 수행하기 위한 플래그.
         self.rh12_initialized = False
+        # rh12_lock: 그리퍼 Open/Close가 거의 동시에 호출될 경우 Modbus 프레임 중복 발송 방지.
         self.rh12_lock = threading.Lock()
 
         # ── 발행: 현재 상태 표시 ────────────────────────────────────────
@@ -330,47 +371,82 @@ class PickPlaceNode(Node):
     # 로봇 모션 헬퍼
     # ────────────────────────────────────────────────────────────────────
     def _go_home(self):
-        # 홈 자세는 작업 시작/종료 시 기준 자세 역할을 한다.
+        """홈 관절 각도로 이동한다.
+
+        홈 자세(기본: [0, 0, 90, 0, 90, 0] deg)는 작업 시작/종료 시 기준 자세다.
+        로봇 앞쪽 시야를 확보하고 카메라가 작업 공간을 내려다볼 수 있는 자세.
+
+        MoveJoint 파라미터 설명:
+          pos        : 목표 관절 각도 6개 (deg) - home_joints 파라미터
+          vel        : 관절 속도 (deg/s) - joint_vel 파라미터
+          acc        : 관절 가속도 (deg/s²) - joint_acc 파라미터
+          time       : 0.0 → vel/acc 기반 자동 계산 (시간 지정이 아님)
+          radius     : 0.0 → 블렌딩 없음 (완전히 정지 후 다음 모션)
+          mode       : 0 = MOVE_MODE_ABSOLUTE (절대 각도 기준)
+          sync_type  : 0 = 동기 (모션 완료까지 서비스 콜 블로킹)
+        """
         req = MoveJoint.Request()
         req.pos = [float(v) for v in self.home_joints]
         req.vel = self.jvel
         req.acc = self.jacc
         req.time = 0.0
         req.radius = 0.0
-        req.mode = 0        # MOVE_MODE_ABSOLUTE
+        req.mode = 0        # MOVE_MODE_ABSOLUTE: 절대 관절 각도 기준
         req.blend_type = 0
-        req.sync_type = 0   # 동기 (블로킹)
+        req.sync_type = 0   # 동기(블로킹): 이동 완료 후 서비스가 응답 반환
         self._call_service(self.cli_movej, req, 'move_joint(home)')
 
     def _move_to_cart(self, x, y, z, rpy,
                       vel=None, acc=None):
-        """
-        Cartesian 직선 이동 (로봇 베이스 프레임 기준, m → mm 변환).
-        rpy: [rx, ry, rz] in degrees.
+        """Cartesian 직선 이동 (로봇 베이스 프레임 기준).
+
+        인자:
+          x, y, z  : 목표 위치 (m 단위, 내부에서 mm로 변환)
+          rpy      : [rx, ry, rz] 방향 (deg 단위)
+          vel      : 선속도(mm/s). None이면 cart_vel 파라미터 사용.
+          acc      : 선가속도(mm/s²). None이면 cart_acc 파라미터 사용.
+
+        Doosan MoveLine 서비스 단위:
+          - 위치: mm (ROS 관례 m와 다름 → x*1000 변환 필수)
+          - 방향: deg
+          - vel: [선속도 mm/s, 각속도 deg/s]
+          - acc: [선가속도 mm/s², 각가속도 deg/s²]
+
+        PICK/PLACE 하강 시에는 vel=50 mm/s로 느리게 접근해 파지 충격을 줄인다.
         """
         req = MoveLine.Request()
-        # Doosan move_line: mm, deg 단위
+        # m → mm 변환: object_detector는 m 단위, Doosan 서비스는 mm 단위
         req.pos = [x * 1000.0, y * 1000.0, z * 1000.0,
                    float(rpy[0]), float(rpy[1]), float(rpy[2])]
         req.vel = [vel if vel else self.cvel, 30.0]     # [선속도 mm/s, 각속도 deg/s]
         req.acc = [acc if acc else self.cacc, 60.0]
         req.time = 0.0
         req.radius = 0.0
-        req.ref = 0         # DR_BASE
-        req.mode = 0        # DR_MV_MOD_ABS
+        req.ref = 0         # DR_BASE: 로봇 베이스 좌표계 기준
+        req.mode = 0        # DR_MV_MOD_ABS: 절대 좌표 기준 이동
         req.blend_type = 0
-        req.sync_type = 0   # 동기
+        req.sync_type = 0   # 동기(블로킹): 이동 완료 후 반환
         self._call_service(self.cli_movel, req, f'move_line({x:.3f},{y:.3f},{z:.3f})')
 
     def _call_service(self, cli, req, name: str):
+        """ROS 2 서비스를 비동기로 호출하고 완료까지 블로킹 폴링한다.
+
+        이 노드는 상태머신을 daemon 스레드에서 실행하고
+        메인 스레드에서 rclpy.spin()이 돌고 있는 구조다.
+        따라서 call_sync()를 쓸 수 없고 call_async() + 폴링으로 구현한다.
+          - call_async(): 서비스 요청을 보내고 future를 즉시 반환
+          - rclpy.spin()이 콜백을 처리하면서 future를 완료 상태로 만든다
+          - 이 함수는 future.done()을 0.05초 간격으로 폴링하며 완료를 기다린다
+
+        타임아웃 15초: Doosan 서비스는 일반적으로 모션 완료까지 수 초가 걸리므로
+        여유 있게 설정. 타임아웃 초과 시 RuntimeError 발생 → 상태머신이 ERROR 진입.
+        """
         future = cli.call_async(req)
         deadline = time.monotonic() + 15.0
-        # 메인 스레드에서 rclpy.spin(node)이 이미 돌고 있으므로
-        # 여기서는 future 완료만 폴링하면 된다.
         while rclpy.ok() and not future.done():
             if time.monotonic() >= deadline:
                 break
-            time.sleep(0.05)
+            time.sleep(0.05)   # 0.05초 간격 폴링 (CPU 점유 최소화)
 
         if not future.done():
             future.cancel()
@@ -378,6 +454,7 @@ class PickPlaceNode(Node):
         res = future.result()
         if res is None:
             raise RuntimeError(f'{name}: 응답 없음')
+        # Doosan 서비스는 success 필드로 성공/실패를 반환하는 경우가 있음
         if hasattr(res, 'success') and not res.success:
             raise RuntimeError(f'{name}: 실패 응답 (success=False)')
         return res
@@ -414,10 +491,19 @@ class PickPlaceNode(Node):
         time.sleep(self.gripper_wait)
 
     def _set_digital_output(self, port: int, active: bool):
-        # 컨트롤 박스 디지털 출력으로 그리퍼 open/close 신호를 보낸다.
+        """컨트롤 박스 디지털 출력(DO) 포트에 신호를 보낸다.
+
+        Doosan 컨트롤 박스 DO는 active low 방식:
+          value=0 → 출력 ON  (active=True 일 때)
+          value=1 → 출력 OFF (active=False 일 때)
+
+        릴레이 방식 그리퍼는 두 포트를 사용해 Open/Close를 각각 제어한다.
+        예) open 시 : port=io_open(ON), port=io_close(OFF)
+            close 시: port=io_open(OFF), port=io_close(ON)
+        """
         req = SetCtrlBoxDigitalOutput.Request()
         req.index = port
-        req.value = 0 if active else 1  # 0=ON, 1=OFF (active low)
+        req.value = 0 if active else 1   # active low: active=True → 0(ON)
         try:
             self._call_service(self.cli_dout, req,
                                f'digital_output(port={port},val={active})')
@@ -425,10 +511,15 @@ class PickPlaceNode(Node):
             self.get_logger().warn(f'Digital Output 오류: {e}')
 
     def _set_tool_digital_output(self, port: int, active: bool):
-        # 툴 플랜지 디지털 출력으로 그리퍼 open/close 신호를 보낸다.
+        """툴 플랜지 디지털 출력(DO) 포트에 신호를 보낸다.
+
+        컨트롤 박스 DO와 동일한 active low 방식.
+        툴 플랜지에 전동 그리퍼가 직접 연결된 경우 사용.
+        gripper_type='tool_digital' 설정 시 이 함수가 호출된다.
+        """
         req = SetToolDigitalOutput.Request()
         req.index = port
-        req.value = 0 if active else 1  # 0=ON, 1=OFF (active low)
+        req.value = 0 if active else 1   # active low
         try:
             self._call_service(self.cli_tool_dout, req,
                                f'tool_digital_output(port={port},val={active})')
@@ -475,24 +566,36 @@ class PickPlaceNode(Node):
         )
 
     def _ensure_rh12_initialized(self):
+        """RH-P12-Rn 그리퍼의 Torque Enable과 Goal Current를 최초 1회 설정한다.
+
+        RH-P12-Rn은 전원 인가 후 Torque Enable(reg 256)과 Goal Current(reg 275)를
+        먼저 설정해야 Stroke 명령에 반응한다.
+
+        초기화 순서 (Modbus FC06, Single Register Write):
+          1. Torque Enable  (register 256, value=1)  : 모터 전원 활성화
+          2. Goal Current   (register 275, value=400) : 최대 전류 제한 (단위: mA 또는 raw)
+             → 너무 높으면 과전류, 너무 낮으면 파지력 부족
+          3. Stroke 명령은 _rh12_move()에서 FC16으로 별도 전송
+
+        rh12_init_wait(기본 0.1초): 레지스터 쓰기 후 그리퍼 내부 처리 시간 확보.
+        """
         if self.rh12_initialized:
             return
 
-        # 강사님 예시처럼 torque enable, goal current를 먼저 넣고 stroke 명령을 보낸다.
         self._rh12_send_frame(
             self._modbus_fc06(
                 slave_id=self.rh12_slave_id,
-                register=self.rh12_torque_enable_register,
-                value=1,
+                register=self.rh12_torque_enable_register,   # 기본: 256
+                value=1,                                      # 1=Enable
             ),
             'rh12_torque_enable',
         )
-        time.sleep(self.rh12_init_wait)
+        time.sleep(self.rh12_init_wait)   # 레지스터 적용 대기
         self._rh12_send_frame(
             self._modbus_fc06(
                 slave_id=self.rh12_slave_id,
-                register=self.rh12_goal_current_register,
-                value=self.rh12_goal_current,
+                register=self.rh12_goal_current_register,    # 기본: 275
+                value=self.rh12_goal_current,                # 기본: 400
             ),
             'rh12_goal_current',
         )
@@ -507,22 +610,44 @@ class PickPlaceNode(Node):
         self._call_service(self.cli_serial_send, req, name)
 
     def _modbus_fc06(self, slave_id: int, register: int, value: int) -> bytes:
+        """Modbus RTU FC06 (Write Single Register) 프레임을 생성한다.
+
+        FC06 프레임 구조 (8바이트):
+          [Slave ID (1)] [0x06 (1)] [Register Addr (2, big-endian)]
+          [Value (2, big-endian)] [CRC16 (2, little-endian)]
+
+        예) slave=1, reg=256, val=1:
+          01 06 01 00 00 01 [CRC_LO] [CRC_HI]
+        """
         frame = bytearray()
         frame.append(slave_id & 0xFF)
-        frame.append(0x06)  # FC06 = Write Single Register
+        frame.append(0x06)   # FC06 = Write Single Register
         frame.extend(int(register).to_bytes(2, byteorder='big', signed=False))
         frame.extend(int(value).to_bytes(2, byteorder='big', signed=False))
         crc = self._modbus_crc16(frame)
+        # CRC는 little-endian (Low byte 먼저)으로 프레임 뒤에 붙인다
         frame.extend(crc.to_bytes(2, byteorder='little', signed=False))
         return bytes(frame)
 
     def _modbus_fc16(self, slave_id: int, start_register: int, values: list[int]) -> bytes:
-        # DART의 modbus_fc16(282, 2, 2, [stroke, 0]) 형태를 ROS2에서 재현한다.
-        register_count = len(values)
-        byte_count = register_count * 2
+        """Modbus RTU FC16 (Write Multiple Registers) 프레임을 생성한다.
+
+        Doosan DART 예시의 modbus_fc16(282, 2, 2, [stroke, 0]) 와 동일한 동작.
+
+        FC16 프레임 구조:
+          [Slave ID (1)] [0x10 (1)] [Start Reg (2, big-endian)]
+          [Reg Count (2, big-endian)] [Byte Count (1)]
+          [Value0 (2, big-endian)] [Value1 (2, big-endian)] ... [CRC16 (2, little-endian)]
+
+        예) slave=1, start_reg=282, values=[700, 0] (열기):
+          01 10 01 1A 00 02 04 02 BC 00 00 [CRC_LO] [CRC_HI]
+          (register 282에 stroke=700, register 283에 0 기록)
+        """
+        register_count = len(values)       # 쓸 레지스터 개수
+        byte_count = register_count * 2    # 데이터 바이트 수 (레지스터 1개 = 2바이트)
         frame = bytearray()
         frame.append(slave_id & 0xFF)
-        frame.append(0x10)  # FC16 = Write Multiple Registers
+        frame.append(0x10)   # FC16 = Write Multiple Registers
         frame.extend(start_register.to_bytes(2, byteorder='big', signed=False))
         frame.extend(register_count.to_bytes(2, byteorder='big', signed=False))
         frame.append(byte_count & 0xFF)
@@ -533,12 +658,23 @@ class PickPlaceNode(Node):
         return bytes(frame)
 
     def _modbus_crc16(self, data: bytes) -> int:
+        """Modbus RTU CRC-16/IBM 체크섬을 계산한다.
+
+        알고리즘: CRC-16/IBM (반사 다항식 0xA001 = 0x8005 반사)
+          1. CRC 초기값 0xFFFF
+          2. 각 바이트와 XOR
+          3. 8번 비트 시프트:
+             - LSB=1이면 오른쪽 시프트 후 다항식 0xA001과 XOR
+             - LSB=0이면 오른쪽 시프트만
+
+        반환: 16비트 CRC 값 (little-endian으로 프레임 뒤에 붙임)
+        """
         crc = 0xFFFF
         for byte in data:
             crc ^= byte
             for _ in range(8):
                 if crc & 0x0001:
-                    crc = (crc >> 1) ^ 0xA001
+                    crc = (crc >> 1) ^ 0xA001   # 다항식 XOR (반사값)
                 else:
                     crc >>= 1
         return crc & 0xFFFF
