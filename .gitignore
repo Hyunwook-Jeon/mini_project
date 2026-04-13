@@ -16,7 +16,8 @@ log/
 # Test / cache
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+*.egg-info/
 
 # Large local model files
 *.pt
-
