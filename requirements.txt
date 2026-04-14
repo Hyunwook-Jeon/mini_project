@@ -1,7 +1,18 @@
 # torch/torchvision 은 setup_env.sh 에서 CUDA wheel로 먼저 설치하는 것을 권장합니다.
-ultralytics>=8.3.0
+
+# ── pip 설치 패키지 ─────────────────────────────────────────────────────────
+numpy==1.26.4
+opencv-python==4.9.0.80
+pyrealsense2==2.57.7.10387
+PyQt5==5.15.6
+ultralytics==8.4.37
 PyYAML>=6.0
-numpy>=1.24.0
-opencv-python>=4.8.0
-# Intel RealSense D435/D455 등 — 거리 측정 시: pip install pyrealsense2
-pyrealsense2>=2.54.0
+
+# ── Doosan Robot2 ROS 2 패키지 (pip install 불가, colcon build 필요) ─────────
+# 빌드 방법:
+#   cd ~/ros2_ws
+#   colcon build --packages-select dsr_msgs2 dsr_bringup2
+#   source install/setup.bash
+#
+# dsr-msgs2==1.1.0        # MoveJoint / MoveLine / SerialSendData 서비스 타입
+# dsr-bringup2==0.1.2     # 로봇 런치 및 설정
