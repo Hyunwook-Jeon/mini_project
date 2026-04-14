@@ -60,10 +60,10 @@ class ObjectDetectorNode(Node):
         self.declare_parameter('use_yolo', True)
         # yolo_model: 'yolov8n.pt' 처럼 모델 크기 코드만 써도 ultralytics가 자동으로 로컬 캐시
         # 또는 네트워크에서 다운로드한다. n(nano) < s < m < l < x 순서로 정확도/속도 트레이드오프.
-        self.declare_parameter('yolo_model', 'yolov8s.pt')
-        self.declare_parameter('confidence_threshold', 0.3)
+        self.declare_parameter('yolo_model', 'yolov8n.pt')
+        self.declare_parameter('confidence_threshold', 0.5)
         # target_classes: 검출 대상 클래스 이름 목록 (COCO 기준). 빈 리스트이면 전체 클래스 허용.
-        self.declare_parameter('target_classes', ['bottle', 'cup', 'bowl'])
+        self.declare_parameter('target_classes', ['bottle', 'cup', 'bowl', 'sports ball', 'orange', 'apple'])
         # depth_scale: RealSense depth 이미지의 raw 값(uint16, mm 단위)을 m 단위로 바꾸는 계수.
         # D400 시리즈 기본값은 0.001 (1 raw = 1 mm).
         self.declare_parameter('depth_scale', 0.001)

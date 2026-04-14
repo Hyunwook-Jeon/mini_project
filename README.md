@@ -23,7 +23,7 @@ Intel RealSense D4xx
 [pick_place_node]                        상태 표시
   상태머신                                     │
   Doosan 서비스 호출                           │ /selected_object_label
-  그리퍼 제어 (IO / RH-P12-Rn)  ◄────────────┘
+  그리퍼 제어 (RH-P12-Rn Modbus RTU)  ◄───────┘
     │
     ▼
 Doosan E0509 + 그리퍼
@@ -106,7 +106,7 @@ IDLE (다음 사이클)
 | Python | 3.10 이상 |
 | 로봇 | Doosan E0509 (또는 가상 모드) |
 | 카메라 | Intel RealSense D400 시리즈 (선택) |
-| 그리퍼 | 디지털 IO, 툴 플랜지 IO, ROBOTIS RH-P12-Rn 중 택1 |
+| 그리퍼 | ROBOTIS RH-P12-Rn (Modbus RTU over serial) |
 
 ---
 
@@ -266,30 +266,22 @@ object_detector:
 
 `target_classes`를 빈 리스트(`[]`)로 설정하면 COCO 전체 클래스를 검출한다.
 
-### 3. 그리퍼 타입 선택
+### 3. 그리퍼 설정 (ROBOTIS RH-P12-Rn)
+
+Modbus RTU over serial 방식으로 제어한다.
 
 ```yaml
 pick_place_node:
   ros__parameters:
-    # 세 가지 중 하나 선택
-    gripper_type: "robotis_rh_p12_rn"  # ROBOTIS RH-P12-Rn (기본)
-    # gripper_type: "digital_io"        # 컨트롤 박스 디지털 출력
-    # gripper_type: "tool_digital"      # 툴 플랜지 디지털 출력
-```
-
-**RH-P12-Rn** (Modbus RTU):
-```yaml
     rh12_open_stroke: 700    # 0~700 범위, 700=완전 개방
     rh12_close_stroke: 0     # 0=완전 폐쇄
     rh12_goal_current: 400   # 파지력 (너무 높으면 과전류, 너무 낮으면 파지 실패)
+    gripper_wait_sec: 0.8    # 그리퍼 동작 완료 대기 시간 (s)
+    rh12_allow_missing_service: true  # 서비스 없을 때 브리지 토픽으로 대체 발행
 ```
 
-**digital_io** / **tool_digital**:
-```yaml
-    gripper_open_io: 1       # Open 신호 포트 번호
-    gripper_close_io: 2      # Close 신호 포트 번호
-    gripper_wait_sec: 0.8    # 동작 완료 대기 시간 (s)
-```
+시리얼 서비스(`/dsr01/gripper/serial_send_data`)가 준비되지 않은 경우
+`/gripper/rh12_stroke_cmd` 토픽으로 stroke 값을 대체 발행한다.
 
 ### 4. 작업 공간 설정
 
@@ -483,6 +475,6 @@ ros2 topic echo /gripper/rh12_stroke_cmd
 ## 추후 보강 항목
 
 - 실제 hand-eye 캘리브레이션 절차 문서
-- 그리퍼 배선 및 IO 맵 다이어그램
+- 그리퍼(RH-P12-Rn) 배선 및 Modbus 레지스터 맵
 - 실제 환경 토픽/TF 예시 스크린샷
 - 자주 발생하는 오류 사례 추가
