@@ -1,0 +1,10 @@
+path: /home/hugo/Downloads/raw_images(label)/raw_images/datasets/yolo_final
+train: images/train
+val: images/val
+nc: 5
+names:
+  0: cup
+  1: doll
+  2: pack
+  3: pencil
+  4: tape

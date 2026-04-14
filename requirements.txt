@@ -1,0 +1,7 @@
+# torch/torchvision 은 setup_env.sh 에서 CUDA wheel로 먼저 설치하는 것을 권장합니다.
+ultralytics>=8.3.0
+PyYAML>=6.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+# Intel RealSense D435/D455 등 — 거리 측정 시: pip install pyrealsense2
+pyrealsense2>=2.54.0

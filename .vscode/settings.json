@@ -1,0 +1,19 @@
+{
+    "ROS2.distro": "humble",
+    "python.autoComplete.extraPaths": [
+        "/home/hugo/ros2_ws/install/test_pkg/lib/python3.10/site-packages",
+        "/home/hugo/ros2_ws/install/service_pkg/lib/python3.10/site-packages",
+        "/home/hugo/ros2_ws/install/my_turtle_pkg/lib/python3.10/site-packages",
+        "/home/hugo/ros2_ws/install/my_interfaces_pkg/local/lib/python3.10/dist-packages",
+        "/home/hugo/ros2_ws/install/dsr_visualservoing/lib/python3.10/site-packages",
+        "/home/hugo/ros2_ws/install/dsr_tests/lib/python3.10/site-packages",
+        "/home/hugo/ros2_ws/install/dsr_mujoco/local/lib/python3.10/dist-packages",
+        "/home/hugo/ros2_ws/install/dsr_bringup2/lib/python3.10/site-packages",
+        "/home/hugo/ros2_ws/install/dsr_msgs2/local/lib/python3.10/dist-packages",
+        "/home/hugo/ros2_ws/install/dsr_example/lib/python3.10/site-packages",
+        "/home/hugo/ros2_ws/install/dsr_common2/lib/python3.10/site-packages",
+        "/home/hugo/kairos_ws/install/bot_py_examples/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}
