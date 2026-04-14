@@ -24,16 +24,11 @@ Doosan E0509 Pick & Place 상태머신 노드.
   /gripper/rh12_stroke_cmd (std_msgs/Int32)            - RH-P12-Rn 서비스 미사용 시 브리지 토픽
 
 Doosan 서비스 클라이언트 (namespace: /dsr01/):
-  motion/move_joint                  (dsr_msgs2/MoveJoint)
-  motion/move_line                   (dsr_msgs2/MoveLine)
-  io/set_ctrl_box_digital_output     (dsr_msgs2/SetCtrlBoxDigitalOutput)
-  io/set_tool_digital_output         (dsr_msgs2/SetToolDigitalOutput)
-  gripper/serial_send_data           (dsr_msgs2/SerialSendData)  [RH-P12-Rn 전용]
+  motion/move_joint        (dsr_msgs2/MoveJoint)
+  motion/move_line         (dsr_msgs2/MoveLine)
+  gripper/serial_send_data (dsr_msgs2/SerialSendData)  [RH-P12-Rn 전용]
 
-지원 그리퍼:
-  digital_io        : 컨트롤 박스 디지털 출력 (relay 방식)
-  tool_digital      : 툴 플랜지 디지털 출력
-  robotis_rh_p12_rn : ROBOTIS RH-P12-Rn (Modbus RTU over serial)
+그리퍼: ROBOTIS RH-P12-Rn (Modbus RTU over serial)
 """
 
 import threading
@@ -45,7 +40,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Int32, String
 
-from dsr_msgs2.srv import MoveJoint, MoveLine, SetCtrlBoxDigitalOutput, SetToolDigitalOutput, SerialSendData
+from dsr_msgs2.srv import MoveJoint, MoveLine, SerialSendData
 
 
 # ── 상태 정의 ───────────────────────────────────────────────────────────
@@ -90,12 +85,7 @@ class PickPlaceNode(Node):
         self.declare_parameter('cart_vel', 100.0)
         self.declare_parameter('cart_acc', 200.0)
         self.declare_parameter('home_joints', [0.0, 0.0, 90.0, 0.0, 90.0, 0.0])
-        self.declare_parameter('gripper_type', 'robotis_rh_p12_rn')
-        self.declare_parameter('gripper_open_io', 1)
-        self.declare_parameter('gripper_close_io', 2)
         self.declare_parameter('gripper_wait_sec', 0.8)
-        self.declare_parameter('tool_digital_open_io', 1)
-        self.declare_parameter('tool_digital_close_io', 2)
         self.declare_parameter('rh12_serial_service', '/dsr01/gripper/serial_send_data')
         self.declare_parameter('rh12_bridge_topic', '/gripper/rh12_stroke_cmd')
         self.declare_parameter('rh12_allow_missing_service', True)
@@ -129,12 +119,7 @@ class PickPlaceNode(Node):
         self.cvel = self.get_parameter('cart_vel').value
         self.cacc = self.get_parameter('cart_acc').value
         self.home_joints = self.get_parameter('home_joints').value
-        self.gripper_type = self.get_parameter('gripper_type').value
-        self.io_open = self.get_parameter('gripper_open_io').value
-        self.io_close = self.get_parameter('gripper_close_io').value
         self.gripper_wait = self.get_parameter('gripper_wait_sec').value
-        self.tool_io_open = self.get_parameter('tool_digital_open_io').value
-        self.tool_io_close = self.get_parameter('tool_digital_close_io').value
         self.rh12_serial_service = self.get_parameter('rh12_serial_service').value
         self.rh12_bridge_topic = self.get_parameter('rh12_bridge_topic').value
         self.rh12_allow_missing_service = self.get_parameter('rh12_allow_missing_service').value
@@ -169,12 +154,6 @@ class PickPlaceNode(Node):
             MoveJoint, f'/{ns}/motion/move_joint')
         self.cli_movel = self.create_client(
             MoveLine, f'/{ns}/motion/move_line')
-        self.cli_dout = self.create_client(
-            SetCtrlBoxDigitalOutput,
-            f'/{ns}/io/set_ctrl_box_digital_output')
-        self.cli_tool_dout = self.create_client(
-            SetToolDigitalOutput,
-            f'/{ns}/io/set_tool_digital_output')
         self.cli_serial_send = self.create_client(
             SerialSendData, self.rh12_serial_service)
 
@@ -216,19 +195,15 @@ class PickPlaceNode(Node):
         required_services = [
             (self.cli_movej, 'move_joint'),
             (self.cli_movel, 'move_line'),
-            (self.cli_dout, 'set_ctrl_box_digital_output'),
         ]
 
-        if self.gripper_type == 'tool_digital':
-            required_services.append((self.cli_tool_dout, 'set_tool_digital_output'))
-        elif self.gripper_type == 'robotis_rh_p12_rn':
-            if self.rh12_allow_missing_service:
-                self.get_logger().warn(
-                    f'{self.rh12_serial_service} 서비스가 없어도 계속 진행합니다. '
-                    f'대신 {self.rh12_bridge_topic} 토픽으로 stroke 명령을 발행합니다.'
-                )
-            else:
-                required_services.append((self.cli_serial_send, self.rh12_serial_service))
+        if self.rh12_allow_missing_service:
+            self.get_logger().warn(
+                f'{self.rh12_serial_service} 서비스가 없어도 계속 진행합니다. '
+                f'대신 {self.rh12_bridge_topic} 토픽으로 stroke 명령을 발행합니다.'
+            )
+        else:
+            required_services.append((self.cli_serial_send, self.rh12_serial_service))
 
         for cli, name in required_services:
             self.get_logger().info(f'서비스 대기 중: {name} ...')
@@ -464,67 +439,13 @@ class PickPlaceNode(Node):
     # ────────────────────────────────────────────────────────────────────
     def _gripper_open(self):
         self.get_logger().info('그리퍼 열기')
-        if self.gripper_type == 'digital_io':
-            self._set_digital_output(self.io_open, active=True)
-            self._set_digital_output(self.io_close, active=False)
-        elif self.gripper_type == 'tool_digital':
-            self._set_tool_digital_output(self.tool_io_open, active=True)
-            self._set_tool_digital_output(self.tool_io_close, active=False)
-        elif self.gripper_type == 'robotis_rh_p12_rn':
-            self._rh12_move(self.rh12_open_stroke)
-        else:
-            self.get_logger().warn(f'지원하지 않는 gripper_type: {self.gripper_type}')
+        self._rh12_move(self.rh12_open_stroke)
         time.sleep(self.gripper_wait)
 
     def _gripper_close(self):
         self.get_logger().info('그리퍼 닫기')
-        if self.gripper_type == 'digital_io':
-            self._set_digital_output(self.io_open, active=False)
-            self._set_digital_output(self.io_close, active=True)
-        elif self.gripper_type == 'tool_digital':
-            self._set_tool_digital_output(self.tool_io_open, active=False)
-            self._set_tool_digital_output(self.tool_io_close, active=True)
-        elif self.gripper_type == 'robotis_rh_p12_rn':
-            self._rh12_move(self.rh12_close_stroke)
-        else:
-            self.get_logger().warn(f'지원하지 않는 gripper_type: {self.gripper_type}')
+        self._rh12_move(self.rh12_close_stroke)
         time.sleep(self.gripper_wait)
-
-    def _set_digital_output(self, port: int, active: bool):
-        """컨트롤 박스 디지털 출력(DO) 포트에 신호를 보낸다.
-
-        Doosan 컨트롤 박스 DO는 active low 방식:
-          value=0 → 출력 ON  (active=True 일 때)
-          value=1 → 출력 OFF (active=False 일 때)
-
-        릴레이 방식 그리퍼는 두 포트를 사용해 Open/Close를 각각 제어한다.
-        예) open 시 : port=io_open(ON), port=io_close(OFF)
-            close 시: port=io_open(OFF), port=io_close(ON)
-        """
-        req = SetCtrlBoxDigitalOutput.Request()
-        req.index = port
-        req.value = 0 if active else 1   # active low: active=True → 0(ON)
-        try:
-            self._call_service(self.cli_dout, req,
-                               f'digital_output(port={port},val={active})')
-        except Exception as e:
-            self.get_logger().warn(f'Digital Output 오류: {e}')
-
-    def _set_tool_digital_output(self, port: int, active: bool):
-        """툴 플랜지 디지털 출력(DO) 포트에 신호를 보낸다.
-
-        컨트롤 박스 DO와 동일한 active low 방식.
-        툴 플랜지에 전동 그리퍼가 직접 연결된 경우 사용.
-        gripper_type='tool_digital' 설정 시 이 함수가 호출된다.
-        """
-        req = SetToolDigitalOutput.Request()
-        req.index = port
-        req.value = 0 if active else 1   # active low
-        try:
-            self._call_service(self.cli_tool_dout, req,
-                               f'tool_digital_output(port={port},val={active})')
-        except Exception as e:
-            self.get_logger().warn(f'Tool Digital Output 오류: {e}')
 
     def _rh12_move(self, stroke: int):
         stroke = max(0, min(700, int(stroke)))
