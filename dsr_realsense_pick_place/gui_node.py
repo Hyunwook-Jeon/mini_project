@@ -35,18 +35,24 @@ Qt-ROS 이벤트 루프 통합:
 import json
 import os
 import sys
+import math
+from pathlib import Path
 
 import numpy as np
 import rclpy
-from cv_bridge import CvBridge
 
-# OpenCV(cv2)를 import하면 자체 Qt 플러그인 경로를 환경변수에 등록하는데,
-# 이 경로의 Qt 버전이 시스템 PyQt5와 달라 "Cannot load platform plugin 'xcb'" 오류가 발생한다.
-# import cv2 전에 QT_QPA_PLATFORM_PLUGIN_PATH를 시스템 Qt5 경로로 고정해 충돌을 방지한다.
-# (Ubuntu 22.04 x86_64 기준 경로. ARM64 또는 Ubuntu 24.04라면 경로가 다를 수 있음)
-os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = '/usr/lib/x86_64-linux-gnu/qt5/plugins'
-os.environ['QT_PLUGIN_PATH'] = '/usr/lib/x86_64-linux-gnu/qt5/plugins'
+try:
+    from cv_bridge import CvBridge
+    _CV_BRIDGE_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover - runtime env dependent
+    CvBridge = None
+    _CV_BRIDGE_IMPORT_ERROR = e
 
+# Qt plugin 경로를 특정 시스템 경로로 강제하면
+# PyQt5/Qt 런타임 버전이 다른 환경에서 xcb 로딩 충돌이 발생할 수 있다.
+# 기본 탐색 경로(가상환경/사용자 site-packages 포함)를 그대로 사용한다.
+
+import cv2
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
@@ -63,25 +69,180 @@ from PyQt5.QtWidgets import (
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+from ultralytics import YOLO
 
 
 class PickPlaceGuiNode(Node):
     def __init__(self):
         super().__init__('pick_place_gui')
 
+        # ROS 디버그 토픽 구독 모드 / 로컬 YOLO 모드 선택
+        self.declare_parameter('use_local_yolo', True)
+        self.declare_parameter('weights_path', '')
+        self.declare_parameter('camera_index', 0)
+        self.declare_parameter('imgsz', 640)
+        self.declare_parameter('conf_threshold', 0.25)
+        self.declare_parameter('fov_h_deg', 60.0)
+        self.declare_parameter('default_object_height_m', 0.12)
+        self.declare_parameter('origin_x', -0.80)
+        self.declare_parameter('origin_y', 0.0)
+        self.declare_parameter('origin_z', -0.96)
+
         # ROS 토픽으로 받은 영상/검출 결과를 Qt 위젯에서 바로 쓸 수 있게
         # 화면 표시용 상태를 멤버 변수로 유지한다.
-        self.bridge = CvBridge()
+        self.use_local_yolo = bool(self.get_parameter('use_local_yolo').value)
+        self.bridge = CvBridge() if CvBridge is not None else None
         self.latest_qimage = None
         self.detected_objects = []
         self.selected_label = ''
         self.pick_place_state = 'IDLE'
+        self._latest_raw_detections = []
 
         # GUI는 직접 로봇을 움직이지 않고 "어떤 물체를 집을지"만 알린다.
         self.pub_selected = self.create_publisher(String, '/selected_object_label', 10)
-        self.create_subscription(Image, '/detection_debug_image', self._cb_image, 10)
-        self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
+        if self.use_local_yolo:
+            self._init_local_yolo()
+        else:
+            if self.bridge is None:
+                raise RuntimeError(
+                    f'cv_bridge import 실패: {_CV_BRIDGE_IMPORT_ERROR}. '
+                    'use_local_yolo=true 로 실행하거나 ROS python 환경을 정리하세요.'
+                )
+            self.create_subscription(Image, '/detection_debug_image', self._cb_image, 10)
+            self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
         self.create_subscription(String, '/pick_place_state', self._cb_state, 10)
+
+    def _repo_root(self) -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    def _find_default_weights(self) -> Path | None:
+        root = self._repo_root() / 'runs'
+        cands = list(root.rglob('best.pt'))
+        if not cands:
+            return None
+        return max(cands, key=lambda p: p.stat().st_mtime)
+
+    def _init_local_yolo(self):
+        weights = str(self.get_parameter('weights_path').value).strip()
+        if weights:
+            self.weights_path = Path(weights).expanduser().resolve()
+        else:
+            found = self._find_default_weights()
+            self.weights_path = found if found is not None else Path('yolov8n.pt')
+
+        self.model = YOLO(str(self.weights_path))
+        self.model_names = (
+            self.model.names
+            if isinstance(self.model.names, dict)
+            else dict(enumerate(self.model.names))
+        )
+        self.cap = cv2.VideoCapture(int(self.get_parameter('camera_index').value))
+        if not self.cap.isOpened():
+            raise RuntimeError('카메라를 열 수 없습니다. camera_index 파라미터를 확인하세요.')
+
+        self.imgsz = int(self.get_parameter('imgsz').value)
+        self.conf_threshold = float(self.get_parameter('conf_threshold').value)
+        self.fov_h_deg = float(self.get_parameter('fov_h_deg').value)
+        self.default_object_height_m = float(self.get_parameter('default_object_height_m').value)
+        self.origin_x = float(self.get_parameter('origin_x').value)
+        self.origin_y = float(self.get_parameter('origin_y').value)
+        self.origin_z = float(self.get_parameter('origin_z').value)
+
+        self.local_timer = self.create_timer(0.033, self._tick_local_yolo)
+        self.get_logger().info(f'로컬 YOLO 모드 시작: weights={self.weights_path}')
+
+    def _intrinsics_from_fov(self, w: int, h: int, fov_h_deg: float):
+        fh = math.radians(fov_h_deg)
+        fx = (0.5 * w) / math.tan(0.5 * fh)
+        fy = fx
+        cx = 0.5 * w
+        cy = 0.5 * h
+        return fx, fy, cx, cy
+
+    def _estimate_depth_m(self, bbox_h_px: float, fy: float, object_height_m: float) -> float:
+        if bbox_h_px < 1.0:
+            return float('nan')
+        return float(fy * object_height_m / bbox_h_px)
+
+    def _camera_to_project_camera_coords(self, x_optical: float, y_optical: float, z_optical: float):
+        return -x_optical, y_optical, -z_optical
+
+    def _to_absolute_coords(self, x_cam: float, y_cam: float, z_cam: float):
+        return (
+            x_cam - self.origin_x,
+            y_cam - self.origin_y,
+            z_cam - self.origin_z,
+        )
+
+    def _tick_local_yolo(self):
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            return
+
+        h, w = frame.shape[:2]
+        fx, fy, cx, cy = self._intrinsics_from_fov(w, h, self.fov_h_deg)
+        results = self.model.predict(
+            frame,
+            imgsz=self.imgsz,
+            conf=self.conf_threshold,
+            verbose=False,
+        )
+        r0 = results[0]
+        out = r0.plot()
+        raw_dets = []
+        objects = []
+
+        if r0.boxes is not None and len(r0.boxes) > 0:
+            boxes = r0.boxes.xyxy.cpu().numpy()
+            clss = r0.boxes.cls.cpu().numpy().astype(int)
+            confs = r0.boxes.conf.cpu().numpy().astype(float)
+            for i, (x1, y1, x2, y2) in enumerate(boxes):
+                cid = int(clss[i]) if i < len(clss) else 0
+                conf = float(confs[i]) if i < len(confs) else 0.0
+                label = self.model_names.get(cid, str(cid))
+                cx_box = 0.5 * (x1 + x2)
+                cy_box = 0.5 * (y1 + y2)
+                bh = max(y2 - y1, 1.0)
+                z_m = self._estimate_depth_m(bh, fy, self.default_object_height_m)
+                if math.isnan(z_m):
+                    continue
+
+                x_opt = ((cx_box - cx) / fx) * z_m
+                y_opt = ((cy_box - cy) / fy) * z_m
+                x_cam, y_cam, z_cam = self._camera_to_project_camera_coords(x_opt, y_opt, z_m)
+                x_abs, y_abs, z_abs = self._to_absolute_coords(x_cam, y_cam, z_cam)
+
+                raw_dets.append((int(round(cx_box)), int(round(cy_box)), int(max(x2 - x1, 1.0)),
+                                 int(max(y2 - y1, 1.0)), label, conf))
+                objects.append({
+                    'label': label,
+                    'confidence': conf,
+                    'depth_m': z_m,
+                    'pixel_u': int(round(cx_box)),
+                    'pixel_v': int(round(cy_box)),
+                    'pose': {'x': x_abs, 'y': y_abs, 'z': z_abs},
+                })
+
+        rgb = np.ascontiguousarray(out[:, :, ::-1])
+        hh, ww, channel = rgb.shape
+        bytes_per_line = channel * ww
+        self.latest_qimage = QImage(
+            rgb.data, ww, hh, bytes_per_line, QImage.Format_RGB888
+        ).copy()
+
+        self._latest_raw_detections = raw_dets
+        self.detected_objects = objects
+        self._update_selected_label_from_local_detections()
+
+    def _update_selected_label_from_local_detections(self):
+        if not self._latest_raw_detections:
+            return
+        if not self.selected_label:
+            # 자동 선택 모드에서는 selected_label을 비워 둔다.
+            return
+        labels = [obj.get('label', '') for obj in self.detected_objects]
+        if self.selected_label not in labels:
+            self.selected_label = ''
 
     def _cb_image(self, msg: Image):
         """ROS Image 메시지를 QImage로 변환해 멤버 변수에 보관한다.
@@ -97,6 +258,8 @@ class PickPlaceGuiNode(Node):
         .copy()는 QImage가 ndarray의 data 포인터를 공유하지 않고 독립 복사본을 갖도록 한다.
         (ndarray가 가비지 컬렉션되면 QImage 데이터가 깨지는 문제 방지)
         """
+        if self.bridge is None:
+            return
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         # OpenCV BGR → Qt RGB: 채널 순서를 뒤집어 [:, :, ::-1]
         rgb = np.ascontiguousarray(frame[:, :, ::-1])
@@ -142,6 +305,7 @@ class PickPlaceGuiNode(Node):
 
     def publish_selected_label(self, label: str):
         # 빈 문자열은 "자동 선택" 모드로 해석된다.
+        self.selected_label = label
         msg = String()
         msg.data = label
         self.pub_selected.publish(msg)

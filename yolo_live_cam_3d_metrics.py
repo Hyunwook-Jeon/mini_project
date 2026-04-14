@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-학습한 best.pt로 실시간 검출 + 무게중심·거리·법선(단위벡터).
+학습한 best.pt로 실시간 검출 + 무게중심 절대좌표(X,Y,Z).
 
-거리 측정 방식 (택일):
+절대좌표 계산용 깊이 추정 방식 (택일):
 
   A) --realsense  Intel RealSense 깊이 센서 (권장) — 박스 ROI 안 깊이 중앙값 (m).
 
   B) 기본 OpenCV 웹캠 — 바운딩 박스 높이 + 물체 추정 높이로 핀홀 근사 (불확실).
 
 무게중심: 검출 박스 중심 (cx, cy) 픽셀.
-
-법선: 깊이 없을 때는 광선 역방향 근사. RealSense 사용 시 깊이 맵에서
-      centroid 인근 소패치의 gradient로 표면 법선을 추정 (완만한 표면에 유효).
+절대좌표: 카메라좌표에서 프로젝트 기준 원점 오프셋을 적용해 계산.
 
 RealSense 실행 예:
 
@@ -134,20 +132,6 @@ def intrinsics_from_fov(
     return fx, fy, cx, cy
 
 
-def ray_unit_opencv(
-    u: float, v: float, fx: float, fy: float, cx: float, cy: float
-) -> np.ndarray:
-    x = (u - cx) / fx
-    y = (v - cy) / fy
-    z = 1.0
-    r = np.array([x, y, z], dtype=np.float64)
-    return r / (np.linalg.norm(r) + 1e-12)
-
-
-def surface_normal_toward_camera(ray_to_point: np.ndarray) -> np.ndarray:
-    return -ray_to_point
-
-
 def estimate_depth_m(
     bbox_h_px: float,
     fy: float,
@@ -204,53 +188,44 @@ def median_depth_in_roi(
     return float(np.median(valid))
 
 
-def normal_from_depth_patch(
-    depth_m: np.ndarray,
-    u: float,
-    v: float,
-    fx: float,
-    fy: float,
-    cx: float,
-    cy: float,
-    patch: int = 9,
-) -> np.ndarray | None:
-    """
-    깊이 맵 중심차분으로 카메라 좌표계 표면 법선(카메라를 향하도록 점 근처).
-    유효 깊이가 너무 적으면 None.
-    """
-    h, w = depth_m.shape
-    ui = int(round(u))
-    vi = int(round(v))
-    r = patch // 2
-    x1 = max(0, ui - r)
-    y1 = max(0, vi - r)
-    x2 = min(w - 1, ui + r)
-    y2 = min(h - 1, vi + r)
-    patch_d = depth_m[y1 : y2 + 1, x1 : x2 + 1].astype(np.float64)
-    m = np.isfinite(patch_d) & (patch_d > 0.05) & (patch_d < 10.0)
-    if np.count_nonzero(m) < patch * 2:
-        return None
-    # 그리드 인덱스 -> 3D 점
-    ys, xs = np.indices(patch_d.shape)
-    glob_x = (x1 + xs).astype(np.float64)
-    glob_y = (y1 + ys).astype(np.float64)
-    z = patch_d
-    x3 = (glob_x - cx) / fx * z
-    y3 = (glob_y - cy) / fy * z
-    valid = m
-    pts = np.stack([x3[valid], y3[valid], z[valid]], axis=1)
-    if pts.shape[0] < 8:
-        return None
-    centroid = pts.mean(axis=0)
-    _, _, vh = np.linalg.svd(pts - centroid, full_matrices=False)
-    n = vh[-1, :]
-    n = n / (np.linalg.norm(n) + 1e-12)
-    # 카메라 쪽을 보도록 부호 정리 (원점 방향과 내적이 양수가 되게)
-    toward_cam = -centroid
-    toward_cam = toward_cam / (np.linalg.norm(toward_cam) + 1e-12)
-    if np.dot(n, toward_cam) < 0:
-        n = -n
-    return n.astype(np.float64)
+def camera_to_project_camera_coords(
+    x_optical: float, y_optical: float, z_optical: float
+) -> tuple[float, float, float]:
+    # 프로젝트 좌표계 정의:
+    # X+: 왼쪽(= optical X의 반대), Y+: 아래(동일), Z+: 카메라 뒤(= optical Z의 반대)
+    return -x_optical, y_optical, -z_optical
+
+
+def to_absolute_coords(
+    x_cam: float,
+    y_cam: float,
+    z_cam: float,
+    origin_x_in_cam: float,
+    origin_y_in_cam: float,
+    origin_z_in_cam: float,
+) -> tuple[float, float, float]:
+    # p_abs = p_cam - origin_cam
+    return (
+        x_cam - origin_x_in_cam,
+        y_cam - origin_y_in_cam,
+        z_cam - origin_z_in_cam,
+    )
+
+
+def apply_calibration_offset_mm(
+    x_abs: float,
+    y_abs: float,
+    z_abs: float,
+    dx_mm: float,
+    dy_mm: float,
+    dz_mm: float,
+) -> tuple[float, float, float]:
+    # mm -> m 로 변환 후 절대좌표에 더한다.
+    return (
+        x_abs + (dx_mm / 1000.0),
+        y_abs + (dy_mm / 1000.0),
+        z_abs + (dz_mm / 1000.0),
+    )
 
 
 def setup_realsense(
@@ -283,7 +258,7 @@ def main() -> None:
     default_yaml = root / "datasets" / "yolo_final" / "data.yaml"
 
     ap = argparse.ArgumentParser(
-        description="YOLO + 거리·무게중심·법선 (RealSense 깊이 또는 웹캠 근사)"
+        description="YOLO + 무게중심 절대좌표(X,Y,Z) (RealSense 깊이 또는 웹캠 근사)"
     )
     ap.add_argument("--weights", type=str, default="", help="비우면 runs/ 최신 best.pt")
     ap.add_argument("--project", type=Path, default=root / "runs", help="best.pt 검색 루트")
@@ -349,6 +324,9 @@ def main() -> None:
     )
     ap.add_argument("--class-heights", type=Path, default=None)
     ap.add_argument("--data-yaml", type=Path, default=default_yaml)
+    ap.add_argument("--origin-x", type=float, default=-0.80, help="절대원점의 카메라 X (m)")
+    ap.add_argument("--origin-y", type=float, default=0.0, help="절대원점의 카메라 Y (m)")
+    ap.add_argument("--origin-z", type=float, default=-0.96, help="절대원점의 카메라 Z (m)")
     args = ap.parse_args()
 
     if args.list_cameras:
@@ -417,6 +395,17 @@ def main() -> None:
     mode = "RealSense depth" if use_rs else "pinhole approx"
     print(f"가중치: {wpath}")
     print(f"device={dev}, 거리={mode}, class_heights={class_heights or '(웹캠만 해당)'}")
+    print(
+        f"absolute origin in camera frame: "
+        f"({args.origin_x:.3f}, {args.origin_y:.3f}, {args.origin_z:.3f}) m"
+    )
+    calib_dx_mm = -20.0
+    calib_dy_mm = -20.0
+    calib_dz_mm = 140.0
+    print(
+        f"calibration offset: dx={calib_dx_mm:+.1f}mm "
+        f"dy={calib_dy_mm:+.1f}mm dz={calib_dz_mm:+.1f}mm"
+    )
     print("종료: q")
 
     try:
@@ -461,11 +450,7 @@ def main() -> None:
             out = r0.plot()
 
             fps = 1.0 / max(t1 - t0, 1e-6)
-            hint = (
-                f"FPS ~{fps:.1f}  RealSense Z=ROI median (m)"
-                if use_rs
-                else f"FPS ~{fps:.1f}  Z~fy*H/h (근사)"
-            )
+            hint = f"FPS ~{fps:.1f}  centroid absolute XYZ (m)"
             cv2.putText(
                 out,
                 hint,
@@ -498,33 +483,27 @@ def main() -> None:
 
                 if use_rs and depth_m is not None:
                     z_m = median_depth_in_roi(depth_m, x1, y1, x2, y2, w, h)
-                    n_est = normal_from_depth_patch(
-                        depth_m, cx_box, cy_box, fx, fy, cx, cy, patch=9
-                    )
-                    if n_est is not None:
-                        normal = n_est
-                    else:
-                        ray = ray_unit_opencv(cx_box, cy_box, fx, fy, cx, cy)
-                        normal = surface_normal_toward_camera(ray)
                 else:
                     z_m = estimate_depth_m(bh, fy, H_m)
-                    ray = ray_unit_opencv(cx_box, cy_box, fx, fy, cx, cy)
-                    normal = surface_normal_toward_camera(ray)
+                if math.isnan(z_m):
+                    continue
+
+                x_opt = ((cx_box - cx) / fx) * z_m
+                y_opt = ((cy_box - cy) / fy) * z_m
+                z_opt = z_m
+                x_cam, y_cam, z_cam = camera_to_project_camera_coords(x_opt, y_opt, z_opt)
+                x_abs, y_abs, z_abs = to_absolute_coords(
+                    x_cam, y_cam, z_cam, args.origin_x, args.origin_y, args.origin_z
+                )
+                x_abs, y_abs, z_abs = apply_calibration_offset_mm(
+                    x_abs, y_abs, z_abs, calib_dx_mm, calib_dy_mm, calib_dz_mm
+                )
 
                 pt = (int(round(cx_box)), int(round(cy_box)))
                 cv2.circle(out, pt, 6, (0, 255, 255), -1, cv2.LINE_AA)
-
-                norm_tip = np.linalg.norm([cx - cx_box, cy - cy_box]) + 1e-6
-                tip = (
-                    int(round(cx + 40 * (cx - cx_box) / norm_tip)),
-                    int(round(cy + 40 * (cy - cy_box) / norm_tip)),
-                )
-                cv2.arrowedLine(out, pt, tip, (255, 180, 0), 2, cv2.LINE_AA, tipLength=0.25)
-
-                z_show = f"{z_m:.3f}m" if not math.isnan(z_m) else "nan"
                 ntxt = (
                     f"{label}  c=({cx_box:.0f},{cy_box:.0f})px  "
-                    f"Z={z_show}  N=[{normal[0]:+.2f},{normal[1]:+.2f},{normal[2]:+.2f}]"
+                    f"ABS=[{x_abs:+.3f},{y_abs:+.3f},{z_abs:+.3f}]m"
                 )
                 cv2.putText(
                     out,
@@ -538,18 +517,10 @@ def main() -> None:
                 )
                 line_y += 18
 
-                if use_rs:
-                    print(
-                        f"[{label}] centroid_px=({cx_box:.1f},{cy_box:.1f}) "
-                        f"dist_m(RealSense median)={z_m}  "
-                        f"normal_cam={normal[0]:+.4f},{normal[1]:+.4f},{normal[2]:+.4f}"
-                    )
-                else:
-                    print(
-                        f"[{label}] centroid_px=({cx_box:.1f},{cy_box:.1f}) "
-                        f"dist_m~(pinhole)={z_m:.3f} (H_ref={H_m}m, h_px={bh:.1f}) "
-                        f"normal_cam={normal[0]:+.4f},{normal[1]:+.4f},{normal[2]:+.4f}"
-                    )
+                print(
+                    f"[{label}] centroid_px=({cx_box:.1f},{cy_box:.1f}) "
+                    f"absolute_xyz=({x_abs:+.4f},{y_abs:+.4f},{z_abs:+.4f}) m"
+                )
 
             cv2.imshow(window, out)
             if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
