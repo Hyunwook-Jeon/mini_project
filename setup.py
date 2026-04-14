@@ -17,11 +17,18 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'numpy',
+        'opencv-python',
+        'ultralytics',
+        'PyQt5',
+        'pyrealsense2',
+    ],
     zip_safe=True,
     maintainer='hyunwook',
     maintainer_email='hyunwook@todo.com',
-    description='Doosan E0509 pick and place with RealSense and YOLO',
+    description='Doosan E0509 pick and place with RealSense, YOLO, and GUI object selection',
     license='BSD',
     tests_require=['pytest'],
     entry_points={
@@ -29,6 +36,7 @@ setup(
             # ros2 run 으로 실행할 엔트리포인트 등록
             'object_detector = dsr_realsense_pick_place.object_detector:main',
             'pick_place_node = dsr_realsense_pick_place.pick_place_node:main',
+            'gui_node = dsr_realsense_pick_place.gui_node:main',
         ],
     },
 )
