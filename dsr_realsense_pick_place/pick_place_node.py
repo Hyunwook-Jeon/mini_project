@@ -39,6 +39,8 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Int32, String
+from std_srvs.srv import Trigger    
+
 
 from dsr_msgs2.srv import MoveJoint, MoveLine, SerialSendData
 
@@ -79,7 +81,7 @@ class PickPlaceNode(Node):
 
         # ── 파라미터 ────────────────────────────────────────────────────
         # 파라미터는 "속도", "그리퍼", "작업영역"처럼 현장에서 자주 조정하는 값들이다.
-        self.declare_parameter('robot_namespace', 'dsr01')
+        self.declare_parameter('robot_namespace', '')
         self.declare_parameter('joint_vel', 30.0)
         self.declare_parameter('joint_acc', 60.0)
         self.declare_parameter('cart_vel', 100.0)
@@ -150,13 +152,18 @@ class PickPlaceNode(Node):
         }
 
         # ── Doosan 서비스 클라이언트 ────────────────────────────────────
+        prefix = f'/{ns}' if ns else ''
         self.cli_movej = self.create_client(
-            MoveJoint, f'/{ns}/motion/move_joint')
+            MoveJoint, f'{prefix}/motion/move_joint')
         self.cli_movel = self.create_client(
-            MoveLine, f'/{ns}/motion/move_line')
+            MoveLine, f'{prefix}/motion/move_line')
         self.cli_serial_send = self.create_client(
             SerialSendData, self.rh12_serial_service)
-
+        
+        # gripper_node 서비스 클라이언트
+        self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
+        self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
+ 
         self._wait_for_services()
 
         # ── 상태 변수 ───────────────────────────────────────────────────
@@ -439,12 +446,12 @@ class PickPlaceNode(Node):
     # ────────────────────────────────────────────────────────────────────
     def _gripper_open(self):
         self.get_logger().info('그리퍼 열기')
-        self._rh12_move(self.rh12_open_stroke)
+        self._call_service(self.cli_gripper_open, Trigger.Request(), 'gripper/open')
         time.sleep(self.gripper_wait)
 
     def _gripper_close(self):
         self.get_logger().info('그리퍼 닫기')
-        self._rh12_move(self.rh12_close_stroke)
+        self._call_service(self.cli_gripper_close, Trigger.Request(), 'gripper/close')
         time.sleep(self.gripper_wait)
 
     def _rh12_move(self, stroke: int):

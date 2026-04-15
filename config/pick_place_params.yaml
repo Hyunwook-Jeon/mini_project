@@ -31,6 +31,17 @@ object_detector:
     depth_outlier_mad_scale: 2.5    # MAD 이상치 제거 스케일 팩터
     selected_object_topic: "/selected_object_label"
 
+# ─── 기존 내용 아래에 추가 ───────────────────────────────────────────
+
+rh_p12_rna_gripper:
+  ros__parameters:
+    robot_ns: ""      
+    stroke_close: 1000        
+    motion_wait: 1.5           
+    svc_timeout: 10.0
+    init_current: 400
+    cube_current: 300
+    
 pick_place_node:
   ros__parameters:
     # --- 로봇 설정 ---
@@ -46,7 +57,7 @@ pick_place_node:
     home_joints: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
 
     # --- 그리퍼 설정 ---
-    gripper_wait_sec: 0.8           # 그리퍼 동작 대기 시간 (s)
+    gripper_wait_sec: 0.1           # 그리퍼 동작 대기 시간 (s)
 
     # --- ROBOTIS RH-P12-Rn 설정 ---
     rh12_serial_service: "/dsr01/gripper/serial_send_data"

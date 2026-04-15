@@ -152,9 +152,27 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('gui')),
     )
 
+
+    # ── 5. Gripper 노드 (로봇 bringup 후 5초 지연 시작) ──────────────────
+    gripper = TimerAction(
+        period=5.0,
+        actions=[
+            Node(
+                package='dsr_realsense_pick_place',
+                executable='gripper_node',
+                name='rh_p12_rna_gripper',
+                output='screen',
+                parameters=[
+                    params_file,
+                    {'robot_ns':''}
+                ]
+            )
+        ]
+    )
+
     # ── 5. Pick & Place 노드 (로봇 bringup 후 5초 지연 시작) ──────────
     pick_place = TimerAction(
-        period=5.0,
+        period=10.0,
         # 로봇 서비스가 올라오기 전에 상태머신이 먼저 시작되지 않도록 잠시 대기한다.
         actions=[
             Node(
@@ -174,5 +192,6 @@ def generate_launch_description():
         static_tf_cam_to_base,
         object_detector,
         gui_node,
+        gripper,
         pick_place,
     ])
