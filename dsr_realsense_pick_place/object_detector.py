@@ -25,6 +25,7 @@ RealSense RGB-D + YOLOv8 기반 객체 검출 노드.
 """
 
 import json
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -96,6 +97,19 @@ class ObjectDetectorNode(Node):
         # True면 위 원점 오프셋으로 절대좌표를 계산하고,
         # False면 기존처럼 TF 카메라→베이스 변환을 사용한다.
         self.declare_parameter('use_manual_absolute_origin', True)
+        # orientation_pca_enabled:
+        # True면 bbox 영역의 깊이 점군에 PCA를 적용해 물체 방향을 추정한다.
+        self.declare_parameter('orientation_pca_enabled', True)
+        # table_normal_output_frame:
+        # 출력 좌표계(absolute_frame 또는 robot_base_frame)에서 테이블 법선 벡터.
+        # 요청사항에 맞춰 Z축은 이 법선으로 고정한다.
+        self.declare_parameter('table_normal_output_frame', [0.0, 0.0, 1.0])
+        # pca_bbox_sample_step_px: bbox 내부 샘플 간격(픽셀). 작을수록 정확하지만 느리다.
+        self.declare_parameter('pca_bbox_sample_step_px', 2)
+        # pca_depth_band_m: 중심 depth 주변 ±band 범위 점만 사용해 배경 혼입을 줄인다.
+        self.declare_parameter('pca_depth_band_m', 0.03)
+        # pca_min_points: PCA를 수행하기 위한 최소 점 개수.
+        self.declare_parameter('pca_min_points', 40)
 
         p = self.get_parameter
         # 자주 쓰는 파라미터는 멤버 변수로 꺼내 두고 이후 계산에 재사용한다.
@@ -117,6 +131,14 @@ class ObjectDetectorNode(Node):
         self.abs_calib_y_m = float(p('absolute_calib_y_mm').value) / 1000.0
         self.abs_calib_z_m = float(p('absolute_calib_z_mm').value) / 1000.0
         self.use_manual_absolute_origin = p('use_manual_absolute_origin').value
+        self.orientation_pca_enabled = p('orientation_pca_enabled').value
+        self.pca_sample_step_px = max(1, int(p('pca_bbox_sample_step_px').value))
+        self.pca_depth_band_m = float(p('pca_depth_band_m').value)
+        self.pca_min_points = max(8, int(p('pca_min_points').value))
+        self.table_normal_out = self._normalize(
+            np.array(p('table_normal_output_frame').value, dtype=np.float64),
+            fallback=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+        )
         self.selected_object_label = ''
         self.last_logged_selected_label = None
 
@@ -265,6 +287,9 @@ class ObjectDetectorNode(Node):
 
         debug_img = color_img.copy()
         candidates = []
+        camera_to_output = self._get_camera_to_output_transform()
+        if camera_to_output is None:
+            return
 
         for u, v, w, h, label, conf in detections:
             # bbox 중심 주변에서 안정적인 depth 대표값을 먼저 구한다.
@@ -287,6 +312,24 @@ class ObjectDetectorNode(Node):
             pose_abs = self._to_absolute_pose(pose_cam)
             if pose_abs is None:
                 continue
+            yaw_deg = None
+            if self.orientation_pca_enabled:
+                orientation_info = self._estimate_orientation_from_pca(
+                    depth_img=depth_img,
+                    center_u=u,
+                    center_v=v,
+                    bbox_w=w,
+                    bbox_h=h,
+                    center_depth_m=depth_m,
+                    cam_to_out=camera_to_output,
+                )
+                if orientation_info is not None:
+                    qx, qy, qz, qw = orientation_info['quat']
+                    pose_abs.pose.orientation.x = qx
+                    pose_abs.pose.orientation.y = qy
+                    pose_abs.pose.orientation.z = qz
+                    pose_abs.pose.orientation.w = qw
+                    yaw_deg = orientation_info['yaw_deg']
 
             pos = pose_abs.pose.position
             candidates.append({
@@ -300,6 +343,7 @@ class ObjectDetectorNode(Node):
                     'x': pos.x,
                     'y': pos.y,
                     'z': pos.z,
+                    'yaw_deg': yaw_deg,
                 },
             })
 
@@ -320,7 +364,8 @@ class ObjectDetectorNode(Node):
         self.pub_selected_pose.publish(pose_abs)
         self.get_logger().info(
             f'[{selected["label"]}] 절대좌표: '
-            f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m'
+            f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m '
+            f'yaw={selected["pose_dict"].get("yaw_deg") if selected["pose_dict"].get("yaw_deg") is not None else "N/A"}'
         )
 
     def _estimate_depth_m(self, depth_img: np.ndarray, u: int, v: int):
@@ -473,6 +518,165 @@ class ObjectDetectorNode(Node):
         pose_abs.pose.orientation = pose_cam.pose.orientation
         return pose_abs
 
+    def _get_camera_to_output_transform(self):
+        """카메라 점을 출력 프레임(absolute/base) 점으로 바꾸는 선형 변환(R, t)을 반환한다."""
+        if self.use_manual_absolute_origin:
+            t = np.array([
+                -self.abs_origin_cam_x + self.abs_calib_x_m,
+                -self.abs_origin_cam_y + self.abs_calib_y_m,
+                -self.abs_origin_cam_z + self.abs_calib_z_m,
+            ], dtype=np.float64)
+            return {
+                'R': np.eye(3, dtype=np.float64),
+                't': t,
+            }
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.robot_base_frame,
+                self.camera_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1),
+            )
+        except Exception as e:
+            self.get_logger().warn(f'TF 조회 실패(camera->base): {e}', throttle_duration_sec=2.0)
+            return None
+
+        rot = tf.transform.rotation
+        trans = tf.transform.translation
+        return {
+            'R': self._quat_to_rot(rot.x, rot.y, rot.z, rot.w),
+            't': np.array([trans.x, trans.y, trans.z], dtype=np.float64),
+        }
+
+    def _estimate_orientation_from_pca(
+        self,
+        depth_img: np.ndarray,
+        center_u: int,
+        center_v: int,
+        bbox_w: int,
+        bbox_h: int,
+        center_depth_m: float,
+        cam_to_out: dict,
+    ):
+        """Z는 테이블 법선으로 고정하고, X는 PCA 단축으로 계산해 orientation을 만든다."""
+        h_img, w_img = depth_img.shape[:2]
+        x0 = max(0, center_u - bbox_w // 2)
+        x1 = min(w_img, center_u + bbox_w // 2 + 1)
+        y0 = max(0, center_v - bbox_h // 2)
+        y1 = min(h_img, center_v + bbox_h // 2 + 1)
+        if x0 >= x1 or y0 >= y1:
+            return None
+
+        points_out = []
+        R = cam_to_out['R']
+        t = cam_to_out['t']
+        min_depth = center_depth_m - self.pca_depth_band_m
+        max_depth = center_depth_m + self.pca_depth_band_m
+        for v in range(y0, y1, self.pca_sample_step_px):
+            for u in range(x0, x1, self.pca_sample_step_px):
+                raw_mm = int(depth_img[v, u])
+                if raw_mm <= 0:
+                    continue
+                d = float(raw_mm) * self.depth_scale
+                if d < self.min_depth or d > self.max_depth:
+                    continue
+                if d < min_depth or d > max_depth:
+                    continue
+                X, Y, Z = rs.rs2_deproject_pixel_to_point(
+                    self.intrinsics,
+                    [float(u), float(v)],
+                    d,
+                )
+                p_cam = np.array([-X, Y, -Z], dtype=np.float64)
+                p_out = R @ p_cam + t
+                points_out.append(p_out)
+
+        if len(points_out) < self.pca_min_points:
+            return None
+
+        pts = np.asarray(points_out, dtype=np.float64)
+        centroid = np.mean(pts, axis=0)
+        z_axis = self.table_normal_out
+        # table_normal과 독립인 평면 기저를 만들고 2D PCA를 수행한다.
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(float(np.dot(ref, z_axis))) > 0.95:
+            ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        basis_u = self._normalize(np.cross(z_axis, ref))
+        basis_v = self._normalize(np.cross(z_axis, basis_u))
+
+        rel = pts - centroid
+        coords_2d = np.column_stack((rel @ basis_u, rel @ basis_v))
+        cov = np.cov(coords_2d, rowvar=False)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        if eigvals.shape[0] < 2:
+            return None
+        # 단축: 작은 고유값의 고유벡터
+        short_axis_2d = eigvecs[:, int(np.argmin(eigvals))]
+        x_axis = self._normalize(short_axis_2d[0] * basis_u + short_axis_2d[1] * basis_v)
+        y_axis = self._normalize(np.cross(z_axis, x_axis))
+        x_axis = self._normalize(np.cross(y_axis, z_axis))
+        if x_axis[0] < 0.0:
+            x_axis = -x_axis
+            y_axis = -y_axis
+
+        R_obj = np.column_stack((x_axis, y_axis, z_axis))
+        quat = self._rot_to_quat(R_obj)
+        yaw_deg = math.degrees(math.atan2(x_axis[1], x_axis[0]))
+        return {
+            'quat': quat,
+            'yaw_deg': float(yaw_deg),
+        }
+
+    def _normalize(self, v: np.ndarray, fallback=None) -> np.ndarray:
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            if fallback is None:
+                return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            return fallback.copy()
+        return v / n
+
+    def _quat_to_rot(self, x: float, y: float, z: float, w: float) -> np.ndarray:
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+        return np.array([
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ], dtype=np.float64)
+
+    def _rot_to_quat(self, R: np.ndarray):
+        tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+        if tr > 0.0:
+            s = math.sqrt(tr + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (R[2, 1] - R[1, 2]) / s
+            qy = (R[0, 2] - R[2, 0]) / s
+            qz = (R[1, 0] - R[0, 1]) / s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+            qw = (R[2, 1] - R[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R[0, 1] + R[1, 0]) / s
+            qz = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+            qw = (R[0, 2] - R[2, 0]) / s
+            qx = (R[0, 1] + R[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+            qw = (R[1, 0] - R[0, 1]) / s
+            qx = (R[0, 2] + R[2, 0]) / s
+            qy = (R[1, 2] + R[2, 1]) / s
+            qz = 0.25 * s
+        n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if n < 1e-9:
+            return (0.0, 0.0, 0.0, 1.0)
+        return (qx / n, qy / n, qz / n, qw / n)
+
     def _publish_detected_objects(self, candidates: list):
         # GUI가 별도 커스텀 메시지 없이 바로 읽을 수 있도록 JSON 문자열로 묶어 발행한다.
         msg = String()
@@ -523,11 +727,14 @@ class ObjectDetectorNode(Node):
         """
         # verbose=False: 매 프레임마다 터미널에 검출 결과가 출력되지 않도록 설정
         results = self.model(img, conf=self.conf_thresh, verbose=False)
+        names = self.model.names
+        if not isinstance(names, dict):
+            names = dict(enumerate(names))
         detections = []
         for r in results:
             for box in r.boxes:
                 cls_id = int(box.cls[0])
-                label = self.model.names[cls_id]   # COCO 클래스 이름 (예: 'bottle')
+                label = names.get(cls_id, str(cls_id))
                 # target_classes가 빈 리스트이면 모든 클래스 통과, 아니면 목록 내 클래스만 허용
                 if self.target_classes and label not in self.target_classes:
                     continue

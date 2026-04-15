@@ -53,7 +53,7 @@ except Exception as e:  # pragma: no cover - runtime env dependent
 
 import cv2
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -214,6 +214,23 @@ class PickPlaceGuiNode(Node):
         self.local_timer = self.create_timer(0.033, self._tick_local_yolo)
         mode = 'RealSense depth' if self.use_realsense else 'pinhole approx'
         self.get_logger().info(f'로컬 YOLO 모드 시작: weights={self.weights_path} | mode={mode}')
+
+    def cleanup_hardware(self):
+        """종료 시 RealSense 파이프라인·웹캠 캡처를 닫는다."""
+        if not getattr(self, 'use_local_yolo', False):
+            return
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+            self.pipeline = None
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
 
     def _intrinsics_from_fov(self, w: int, h: int, fov_h_deg: float):
         fh = math.radians(fov_h_deg)
@@ -515,6 +532,7 @@ class PickPlaceGui(QWidget):
         # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
         if self.ros_node.latest_qimage is not None:
             pixmap = QPixmap.fromImage(self.ros_node.latest_qimage)
+            self._draw_object_frames_on_pixmap(pixmap)
             scaled = pixmap.scaled(
                 self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
@@ -548,29 +566,25 @@ class PickPlaceGui(QWidget):
 
         그리드 배치: 2열 그리드 (row = idx // 2, col = idx % 2)
         """
-        active_labels = set(labels)   # 현재 프레임에서 검출된 라벨 집합
+        active_labels = set(labels)
+        for button in self.object_buttons.values():
+            self.button_grid.removeWidget(button)
+
         for idx, label in enumerate(labels):
             button = self.object_buttons.get(label)
             if button is None:
-                # 처음 등장한 라벨: 새 버튼 생성 후 dict와 그리드에 등록
                 button = QPushButton(label)
-                # lambda 캡처 주의: text=label로 현재 값을 고정해야
-                # 루프 변수 label이 나중에 변해도 클릭 시 올바른 값이 전달된다
                 button.clicked.connect(lambda checked=False, text=label: self._select_label(text))
                 self.object_buttons[label] = button
-                row = idx // 2   # 2열 그리드
-                col = idx % 2
-                self.button_grid.addWidget(button, row, col)
             button.setVisible(True)
-            # 선택된 라벨 버튼: GitHub 파란색(#1f6feb)으로 강조
             if label == self.ros_node.selected_label and self.ros_node.selected_label:
                 button.setStyleSheet(
                     'background-color: #1f6feb; color: white; font-weight: bold;'
                 )
             else:
-                button.setStyleSheet('')   # 기본 스타일 복원
+                button.setStyleSheet('')
+            self.button_grid.addWidget(button, idx // 2, idx % 2)
 
-        # 이번 프레임에 없는 라벨 버튼은 숨김 처리 (삭제하지 않고 재사용 대기)
         for label, button in self.object_buttons.items():
             if label not in active_labels:
                 button.setVisible(False)
@@ -584,12 +598,59 @@ class PickPlaceGui(QWidget):
         lines = []
         for item in self.ros_node.detected_objects:
             pose = item.get('pose', {})
+            yaw = pose.get('yaw_deg', None)
+            yaw_text = f'{yaw:+.1f}deg' if isinstance(yaw, (int, float)) else 'N/A'
             lines.append(
                 f"- {item.get('label', 'unknown')} | "
                 f"conf={item.get('confidence', 0.0):.2f} | "
-                f"x={pose.get('x', 0.0):.3f}, y={pose.get('y', 0.0):.3f}, z={pose.get('z', 0.0):.3f}"
+                f"x={pose.get('x', 0.0):.3f}, y={pose.get('y', 0.0):.3f}, z={pose.get('z', 0.0):.3f}, yaw={yaw_text}"
             )
         self.object_summary.setText('\n'.join(lines))
+
+    def _draw_object_frames_on_pixmap(self, pixmap: QPixmap):
+        """검출 물체의 픽셀 중심에 간단한 좌표계(X/Z) 오버레이를 그린다."""
+        if pixmap.isNull():
+            return
+        painter = QPainter(pixmap)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            x_pen = QPen(QColor(255, 80, 80), 2)     # X축: 빨강
+            z_pen = QPen(QColor(80, 220, 255), 2)    # Z축(테이블 법선): 하늘색
+            center_pen = QPen(QColor(255, 255, 0), 2)
+            text_pen = QPen(QColor(255, 255, 255), 1)
+            axis_len = 34
+
+            for item in self.ros_node.detected_objects:
+                u = int(item.get('pixel_u', -1))
+                v = int(item.get('pixel_v', -1))
+                if u < 0 or v < 0:
+                    continue
+
+                pose = item.get('pose', {})
+                yaw_deg = pose.get('yaw_deg', None)
+
+                painter.setPen(center_pen)
+                painter.drawEllipse(u - 3, v - 3, 6, 6)
+
+                if isinstance(yaw_deg, (int, float)):
+                    yaw_rad = math.radians(float(yaw_deg))
+                    dx = axis_len * math.cos(yaw_rad)
+                    dy = -axis_len * math.sin(yaw_rad)
+                    painter.setPen(x_pen)
+                    painter.drawLine(u, v, int(round(u + dx)), int(round(v + dy)))
+                    painter.drawText(int(round(u + dx + 4)), int(round(v + dy - 4)), 'X')
+
+                painter.setPen(z_pen)
+                painter.drawLine(u, v, u, v - axis_len)
+                painter.drawText(u + 4, v - axis_len - 4, 'Z')
+
+                painter.setPen(text_pen)
+                label = item.get('label', 'obj')
+                yaw_text = f'{float(yaw_deg):+.1f}deg' if isinstance(yaw_deg, (int, float)) else 'yaw=N/A'
+                painter.drawText(u + 8, v + 16, f'{label} {yaw_text}')
+        finally:
+            painter.end()
 
     def _build_selection_status(self):
         # 사용자가 아무 것도 고르지 않았으면 자동 선택 모드 상태를 명확히 보여 준다.
@@ -629,6 +690,7 @@ def main(args=None):
     timer.start(10)   # 10ms = 약 100Hz, 카메라 30fps에 비해 충분히 빠름
 
     exit_code = app.exec_()   # Qt 이벤트 루프 진입 (창 닫힐 때까지 블로킹)
+    node.cleanup_hardware()
     node.destroy_node()
     rclpy.shutdown()
     sys.exit(exit_code)
