@@ -15,7 +15,7 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "/home/kelly/doosan_ws/src/mini_project/best.pt"       # yolov8n/s/m/l/x.pt 중 선택
+    yolo_model: "~/doosan_ws/src/mini_project/best.pt"
     confidence_threshold: 0.5
 
     # 인식할 클래스 목록 (빈 리스트이면 모든 클래스)
