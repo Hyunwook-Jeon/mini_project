@@ -86,8 +86,8 @@ class PickPlaceNode(Node):
         self.declare_parameter('rh12_close_stroke',           0)
         self.declare_parameter('rh12_port',                   1)
         self.declare_parameter('rh12_init_wait_sec',          0.1)
-        self.declare_parameter('pre_pick_z_offset',           0.12)
-        self.declare_parameter('pick_z_offset',               0.005)
+        self.declare_parameter('pre_pick_z_offset',           0.14)
+        self.declare_parameter('pick_z_offset',               0.015)
         self.declare_parameter('grasp_rpy',                   [0.0, 180.0, 0.0])
         self.declare_parameter('place_position',              [0.4, -0.3, 0.1])
         self.declare_parameter('pre_place_z_offset',          0.15)
@@ -99,6 +99,7 @@ class PickPlaceNode(Node):
         self.declare_parameter('workspace_z_min',             0.0)
         self.declare_parameter('workspace_z_max',             0.60)
         self.declare_parameter('target_pose_topic',           '/selected_object_pose')
+        self.declare_parameter('selected_object_topic',       '/selected_object_label')
 
         ns = self.get_parameter('robot_namespace').value
         self.jvel         = self.get_parameter('joint_vel').value
@@ -155,6 +156,8 @@ class PickPlaceNode(Node):
         self.state       = State.IDLE
         self.state_lock  = threading.Lock()
         self.target_pose: PoseStamped | None = None
+        self.pick_requested = False
+        self.pending_command: str | None = None
         self.rh12_initialized = False
         # rh12_lock: Open/Close 거의 동시 호출 시 Modbus 프레임 중복 발송 방지
         self.rh12_lock   = threading.Lock()
@@ -162,10 +165,17 @@ class PickPlaceNode(Node):
         # ── 퍼블리셔 / 구독 ─────────────────────────────────────────────
         self.pub_state       = self.create_publisher(String, '/pick_place_state', 10)
         self.pub_rh12_stroke = self.create_publisher(Int32,  self.rh12_bridge_topic, 10)
+        self.pub_selected    = self.create_publisher(
+            String,
+            self.get_parameter('selected_object_topic').value,
+            10,
+        )
         self.create_subscription(
             PoseStamped,
             self.get_parameter('target_pose_topic').value,
             self._cb_pose, 10)
+        self.create_service(Trigger, '/pick_place/run_once', self._srv_run_once)
+        self.create_service(Trigger, '/pick_place/go_home', self._srv_go_home)
 
         # ── 상태머신 스레드 ─────────────────────────────────────────────
         # daemon=True: 메인 스레드(rclpy.spin) 종료 시 자동으로 함께 종료
@@ -224,7 +234,7 @@ class PickPlaceNode(Node):
     def _cb_pose(self, msg: PoseStamped):
         with self.state_lock:
             # DETECTING 상태일 때만 새 타겟을 수신해 다음 단계로 넘어간다
-            if self.state == State.DETECTING:
+            if self.state == State.DETECTING and self.pick_requested:
                 pos = msg.pose.position
                 if self._in_workspace(pos.x, pos.y, pos.z):
                     self.target_pose = msg
@@ -246,6 +256,15 @@ class PickPlaceNode(Node):
     # ────────────────────────────────────────────────────────────────────
     def _state_machine_loop(self):
         while rclpy.ok():
+            command = self._pop_pending_command()
+            if command is not None:
+                try:
+                    self._execute_manual_command(command)
+                except Exception as e:
+                    self.get_logger().error(f'수동 명령 예외({command}): {e}')
+                    self._set_state(State.ERROR)
+                continue
+
             with self.state_lock:
                 current = self.state
 
@@ -254,9 +273,7 @@ class PickPlaceNode(Node):
 
             try:
                 if current == State.IDLE:
-                    self.get_logger().info('홈으로 이동 후 DETECTING 대기...')
-                    self._go_home()
-                    self._set_state(State.DETECTING)
+                    time.sleep(0.1)
 
                 elif current == State.DETECTING:
                     time.sleep(0.1)  # 포즈 콜백 대기 (CPU 점유 최소화)
@@ -318,7 +335,7 @@ class PickPlaceNode(Node):
 
                 elif current == State.HOME:
                     self._go_home()
-                    self._set_state(State.IDLE)
+                    self._finish_cycle()
 
                 elif current == State.ERROR:
                     self.get_logger().error('오류 발생. 수동 복구 필요.')
@@ -332,6 +349,87 @@ class PickPlaceNode(Node):
         with self.state_lock:
             self.state = s
         self.get_logger().info(f'→ 상태 전환: {s.name}')
+
+    def _enqueue_command(self, command: str) -> bool:
+        with self.state_lock:
+            if self.pending_command is not None:
+                return False
+            self.pending_command = command
+        return True
+
+    def _pop_pending_command(self) -> str | None:
+        with self.state_lock:
+            command = self.pending_command
+            self.pending_command = None
+        return command
+
+    def _execute_manual_command(self, command: str):
+        if command == 'run_once':
+            self.get_logger().info('1회 Pick & Place 요청 수신')
+            self._clear_target()
+            self.pick_requested = True
+            self._set_state(State.HOME)
+            self._go_home()
+            self._set_state(State.DETECTING)
+            return
+
+        if command == 'go_home':
+            self.get_logger().info('수동 홈 이동 요청 수신')
+            self.pick_requested = False
+            self._clear_target()
+            self._clear_selected_label()
+            self._set_state(State.HOME)
+            self._go_home()
+            self._set_state(State.IDLE)
+            return
+
+        raise RuntimeError(f'알 수 없는 명령: {command}')
+
+    def _clear_target(self):
+        with self.state_lock:
+            self.target_pose = None
+
+    def _finish_cycle(self):
+        self.pick_requested = False
+        self._clear_target()
+        self._clear_selected_label()
+        self._set_state(State.IDLE)
+
+    def _clear_selected_label(self):
+        msg = String()
+        msg.data = ''
+        self.pub_selected.publish(msg)
+
+    def _srv_run_once(self, _, res: Trigger.Response):
+        with self.state_lock:
+            busy = self.state != State.IDLE or self.pending_command is not None
+        if busy:
+            res.success = False
+            res.message = '현재 작업 중이어서 1회 실행을 시작할 수 없습니다.'
+            return res
+        if not self._enqueue_command('run_once'):
+            res.success = False
+            res.message = '대기 중인 명령이 있습니다.'
+            return res
+        res.success = True
+        res.message = '1회 Pick & Place 실행을 예약했습니다.'
+        return res
+
+    def _srv_go_home(self, _, res: Trigger.Response):
+        with self.state_lock:
+            busy_state = self.state not in (State.IDLE, State.DETECTING, State.ERROR)
+            command_pending = self.pending_command is not None
+        if busy_state or command_pending:
+            res.success = False
+            res.message = '현재 모션 수행 중이어서 홈 이동을 예약할 수 없습니다.'
+            return res
+        if not self._enqueue_command('go_home'):
+            res.success = False
+            res.message = '대기 중인 명령이 있습니다.'
+            return res
+        res.success = True
+        res.message = '홈 이동을 예약했습니다.'
+        return res
 
     def _publish_state(self, name: str):
         msg = String()
@@ -571,8 +669,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

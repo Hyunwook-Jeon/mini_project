@@ -32,6 +32,7 @@ Qt-ROS 이벤트 루프 통합:
                                                  빈 문자열 = 자동 선택 모드
 """
 
+import os
 import json
 import sys
 import math
@@ -47,11 +48,18 @@ except Exception as e:  # pragma: no cover - runtime env dependent
     CvBridge = None
     _CV_BRIDGE_IMPORT_ERROR = e
 
-# Qt plugin 경로를 특정 시스템 경로로 강제하면
-# PyQt5/Qt 런타임 버전이 다른 환경에서 xcb 로딩 충돌이 발생할 수 있다.
-# 기본 탐색 경로(가상환경/사용자 site-packages 포함)를 그대로 사용한다.
-
 import cv2
+# OpenCV 패키지가 cv2/qt/plugins 경로를 잡아 버리면
+# PyQt5와 Qt 런타임 버전이 엇갈려 xcb 플러그인 로딩이 깨질 수 있다.
+for key in ('QT_QPA_PLATFORM_PLUGIN_PATH', 'QT_PLUGIN_PATH'):
+    value = os.environ.get(key, '')
+    if 'cv2/qt/plugins' in value:
+        os.environ.pop(key, None)
+
+# GNOME Wayland 환경에서는 Qt가 xcb/wayland 사이에서 흔들릴 수 있어
+# 별도 설정이 없으면 XWayland(xcb)로 고정한다.
+os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
+
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
@@ -65,10 +73,14 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt5.QtCore import QLibraryInfo
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 from ultralytics import YOLO
+
+os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = QLibraryInfo.location(QLibraryInfo.PluginsPath)
 
 
 class PickPlaceGuiNode(Node):
@@ -76,7 +88,9 @@ class PickPlaceGuiNode(Node):
         super().__init__('pick_place_gui')
 
         # ROS 디버그 토픽 구독 모드 / 로컬 YOLO 모드 선택
-        self.declare_parameter('use_local_yolo', True)
+        # 기본값은 false: object_detector가 이미 RealSense를 사용하므로
+        # GUI가 카메라를 다시 열지 않게 한다.
+        self.declare_parameter('use_local_yolo', False)
         self.declare_parameter('weights_path', '')
         self.declare_parameter('require_best_pt', True)
         self.declare_parameter('camera_index', 0)
@@ -108,6 +122,10 @@ class PickPlaceGuiNode(Node):
 
         # GUI는 직접 로봇을 움직이지 않고 "어떤 물체를 집을지"만 알린다.
         self.pub_selected = self.create_publisher(String, '/selected_object_label', 10)
+        self.cli_run_once = self.create_client(Trigger, '/pick_place/run_once')
+        self.cli_go_home = self.create_client(Trigger, '/pick_place/go_home')
+        self.cli_gripper_open = self.create_client(Trigger, '/gripper/open')
+        self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
         if self.use_local_yolo:
             self._init_local_yolo()
         else:
@@ -123,6 +141,50 @@ class PickPlaceGuiNode(Node):
     def _repo_root(self) -> Path:
         return Path(__file__).resolve().parent.parent
 
+    def _candidate_search_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[Path] = set()
+
+        def _add(path: Path):
+            resolved = path.resolve()
+            if resolved not in seen and resolved.exists():
+                seen.add(resolved)
+                roots.append(resolved)
+
+        _add(self._repo_root())
+        _add(Path.cwd())
+        _add(Path.cwd() / 'mini_project')
+
+        for parent in Path(__file__).resolve().parents:
+            _add(parent)
+            _add(parent / 'src')
+            _add(parent / 'src' / 'mini_project')
+
+        return roots
+
+    def _resolve_weights_path(self, weights: str) -> Path:
+        configured = Path(weights).expanduser()
+        if configured.is_absolute():
+            return configured.resolve()
+
+        candidates = [root / configured for root in self._candidate_search_roots()]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+
+        matches: list[Path] = []
+        for root in self._candidate_search_roots():
+            matches.extend(p for p in root.rglob(configured.name) if p.is_file())
+
+        if matches:
+            suffix = configured.as_posix()
+            for match in matches:
+                if match.as_posix().endswith(suffix):
+                    return match.resolve()
+            return matches[0].resolve()
+
+        return (self._repo_root() / configured).resolve()
+
     def _find_best_pt(self, search_under: Path) -> Path | None:
         cands = list(search_under.rglob('best.pt'))
         if not cands:
@@ -133,15 +195,14 @@ class PickPlaceGuiNode(Node):
         weights = str(self.get_parameter('weights_path').value).strip()
         require_best_pt = bool(self.get_parameter('require_best_pt').value)
         if weights:
-            configured = Path(weights).expanduser()
-            if configured.is_absolute():
-                self.weights_path = configured.resolve()
-            else:
-                # 팀 환경 호환: 상대경로는 프로젝트 루트 기준으로 해석한다.
-                self.weights_path = (self._repo_root() / configured).resolve()
+            self.weights_path = self._resolve_weights_path(weights)
         else:
             # yolo_live_cam_3d_metrics.py 와 동일하게 runs 아래 최신 best.pt를 기본 사용
-            found = self._find_best_pt(self._repo_root() / 'runs')
+            found = None
+            for root in self._candidate_search_roots():
+                found = self._find_best_pt(root / 'runs')
+                if found is not None:
+                    break
             if found is None and require_best_pt:
                 raise RuntimeError(
                     'runs 아래에서 best.pt를 찾지 못했습니다. '
@@ -462,6 +523,24 @@ class PickPlaceGuiNode(Node):
         msg.data = label
         self.pub_selected.publish(msg)
 
+    def call_trigger_service(self, client, label: str):
+        if not client.service_is_ready():
+            self.get_logger().warn(f'서비스 미연결: {label}')
+            return
+
+        future = client.call_async(Trigger.Request())
+
+        def _done(done_future):
+            try:
+                res = done_future.result()
+            except Exception as e:
+                self.get_logger().error(f'{label} 호출 실패: {e}')
+                return
+            status = '성공' if res.success else '거절'
+            self.get_logger().info(f'{label}: {status} - {res.message}')
+
+        future.add_done_callback(_done)
+
 
 class PickPlaceGui(QWidget):
     def __init__(self, ros_node: PickPlaceGuiNode):
@@ -471,7 +550,9 @@ class PickPlaceGui(QWidget):
 
         # 좌측은 카메라 영상, 우측은 상태/선택 패널로 나누어 배치한다.
         self.setWindowTitle('DSR RealSense Pick & Place GUI')
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.resize(1100, 720)
+        self.move(40, 40)
 
         root = QHBoxLayout(self)
 
@@ -495,6 +576,18 @@ class PickPlaceGui(QWidget):
         status_layout.addWidget(self.selection_label)
         status_layout.addWidget(self.selection_status_label)
 
+        control_group = QGroupBox('수동 제어')
+        control_layout = QVBoxLayout(control_group)
+        self.home_button = QPushButton('HOME 이동')
+        self.home_button.clicked.connect(self._go_home)
+        self.gripper_open_button = QPushButton('그리퍼 OPEN')
+        self.gripper_open_button.clicked.connect(self._gripper_open)
+        self.gripper_close_button = QPushButton('그리퍼 CLOSE')
+        self.gripper_close_button.clicked.connect(self._gripper_close)
+        control_layout.addWidget(self.home_button)
+        control_layout.addWidget(self.gripper_open_button)
+        control_layout.addWidget(self.gripper_close_button)
+
         object_group = QGroupBox('검출된 물체 선택')
         object_layout = QVBoxLayout(object_group)
         self.auto_button = QPushButton('자동 선택 사용')
@@ -513,6 +606,7 @@ class PickPlaceGui(QWidget):
         object_layout.addWidget(self.object_summary)
 
         right_panel.addWidget(status_group)
+        right_panel.addWidget(control_group)
         right_panel.addWidget(object_group)
         right_panel.addStretch(1)
 
@@ -524,9 +618,18 @@ class PickPlaceGui(QWidget):
         self.timer.start(100)
 
     def _select_label(self, label: str):
-        # 버튼을 누르면 선택 라벨만 ROS 토픽으로 보낸다.
-        # 실제 목표 선택은 object_detector 쪽에서 다시 수행한다.
         self.ros_node.publish_selected_label(label)
+        if label:
+            self.ros_node.call_trigger_service(self.ros_node.cli_run_once, 'pick_place/run_once')
+
+    def _go_home(self):
+        self.ros_node.call_trigger_service(self.ros_node.cli_go_home, 'pick_place/go_home')
+
+    def _gripper_open(self):
+        self.ros_node.call_trigger_service(self.ros_node.cli_gripper_open, 'gripper/open')
+
+    def _gripper_close(self):
+        self.ros_node.call_trigger_service(self.ros_node.cli_gripper_close, 'gripper/close')
 
     def _update_ui(self):
         # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
@@ -543,6 +646,11 @@ class PickPlaceGui(QWidget):
         self.state_label.setText(f'Pick & Place 상태: {self.ros_node.pick_place_state}')
         self.selection_label.setText(f'선택 물체: {selected_text}')
         self.selection_status_label.setText(self._build_selection_status())
+        manual_enabled = self.ros_node.pick_place_state in ('IDLE', 'DETECTING', 'ERROR')
+        self.home_button.setEnabled(manual_enabled)
+        self.gripper_open_button.setEnabled(manual_enabled)
+        self.gripper_close_button.setEnabled(manual_enabled)
+        self.auto_button.setEnabled(self.ros_node.pick_place_state == 'IDLE')
 
         # 같은 라벨의 물체가 여러 개 검출될 수 있으므로 버튼은 라벨 단위로만 만든다.
         labels = []
@@ -577,6 +685,7 @@ class PickPlaceGui(QWidget):
                 button.clicked.connect(lambda checked=False, text=label: self._select_label(text))
                 self.object_buttons[label] = button
             button.setVisible(True)
+            button.setEnabled(self.ros_node.pick_place_state == 'IDLE')
             if label == self.ros_node.selected_label and self.ros_node.selected_label:
                 button.setStyleSheet(
                     'background-color: #1f6feb; color: white; font-weight: bold;'
@@ -682,6 +791,8 @@ def main(args=None):
     app = QApplication(sys.argv)
     gui = PickPlaceGui(node)
     gui.show()
+    gui.raise_()
+    gui.activateWindow()
 
     # ROS 콜백 처리용 타이머: 10ms마다 spin_once() 호출
     # timeout_sec=0.0: 대기 없이 현재 큐에 있는 콜백만 즉시 처리
@@ -690,9 +801,11 @@ def main(args=None):
     timer.start(10)   # 10ms = 약 100Hz, 카메라 30fps에 비해 충분히 빠름
 
     exit_code = app.exec_()   # Qt 이벤트 루프 진입 (창 닫힐 때까지 블로킹)
+    timer.stop()
     node.cleanup_hardware()
-    node.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():
+        node.destroy_node()
+        rclpy.shutdown()
     sys.exit(exit_code)
 
 

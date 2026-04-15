@@ -37,6 +37,7 @@ setup(
             'object_detector = dsr_realsense_pick_place.object_detector:main',
             'pick_place_node = dsr_realsense_pick_place.pick_place_node:main',
             'gui_node = dsr_realsense_pick_place.gui_node:main',
+            'gripper_node = dsr_realsense_pick_place.gripper_node:main',
         ],
     },
 )

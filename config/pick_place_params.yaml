@@ -15,7 +15,7 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "/home/kelly/doosan_ws/src/mini_project/best.pt"       # yolov8n/s/m/l/x.pt 중 선택
+    yolo_model: "/home/hyunwook/ros2_ws/src/mini_project/runs/weights/weights/best.pt"
     confidence_threshold: 0.5
 
     # 인식할 클래스 목록 (빈 리스트이면 모든 클래스)
@@ -60,6 +60,10 @@ rh_p12_rna_gripper:
     svc_timeout: 10.0
     init_current: 400
     cube_current: 300
+
+pick_place_gui:
+  ros__parameters:
+    use_local_yolo: false
     
 pick_place_node:
   ros__parameters:
@@ -93,8 +97,8 @@ pick_place_node:
     rh12_init_wait_sec: 0.1
 
     # --- Pick 파라미터 ---
-    pre_pick_z_offset: 0.12         # Pick 위 대기 높이 오프셋 (m)
-    pick_z_offset: 0.005            # 실제 픽 높이 보정 (m)
+    pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)
+    pick_z_offset: 0.015            # 실제 픽 높이 보정 (m)
     grasp_rpy: [0.0, 180.0, 0.0]    # 그리퍼 자세 (rx, ry, rz deg)
                                     # [0, 180, 0] = 수직 하강
 

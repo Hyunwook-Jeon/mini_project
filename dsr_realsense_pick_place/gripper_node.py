@@ -352,9 +352,10 @@ class GripperNode(Node):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def destroy_node(self):
-        self.get_logger().info("노드 종료 — 토크 OFF")
-        pkts = [ModbusRTU.fc06(GP.SLAVE_ID, Reg.TORQUE_ENABLE, 0)]
-        self._run_packets(pkts, motion_wait=0.0, label="shutdown")
+        if rclpy.ok():
+            self.get_logger().info("노드 종료 — 토크 OFF")
+            pkts = [ModbusRTU.fc06(GP.SLAVE_ID, Reg.TORQUE_ENABLE, 0)]
+            self._run_packets(pkts, motion_wait=0.0, label="shutdown")
         super().destroy_node()
 
 
@@ -363,6 +364,7 @@ class GripperNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     executor = MultiThreadedExecutor(num_threads=4)
+    node = None
     try:
         node = GripperNode()
         executor.add_node(node)
@@ -370,8 +372,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None and rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
