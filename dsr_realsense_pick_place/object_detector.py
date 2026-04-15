@@ -523,11 +523,14 @@ class ObjectDetectorNode(Node):
         """
         # verbose=False: 매 프레임마다 터미널에 검출 결과가 출력되지 않도록 설정
         results = self.model(img, conf=self.conf_thresh, verbose=False)
+        names = self.model.names
+        if not isinstance(names, dict):
+            names = dict(enumerate(names))
         detections = []
         for r in results:
             for box in r.boxes:
                 cls_id = int(box.cls[0])
-                label = self.model.names[cls_id]   # COCO 클래스 이름 (예: 'bottle')
+                label = names.get(cls_id, str(cls_id))
                 # target_classes가 빈 리스트이면 모든 클래스 통과, 아니면 목록 내 클래스만 허용
                 if self.target_classes and label not in self.target_classes:
                     continue

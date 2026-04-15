@@ -37,7 +37,6 @@ def resolve_image_path(json_path: Path, data: dict[str, Any]) -> Path | None:
     cand = (json_path.parent / rel).resolve()
     if cand.is_file():
         return cand
-    stem = json_path.stem
     for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
         c = json_path.with_suffix(ext)
         if c.is_file():
