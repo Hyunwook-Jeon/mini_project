@@ -127,13 +127,17 @@ def generate_launch_description():
         parameters=[params_file],
     )
 
-    # ── 6. GUI 노드 ─────────────────────────────────────────────────────
+    # ── 6. GUI 노드 (전체 런치에서는 use_local_yolo=false 로 덮어써
+    #     realsense2_camera 와 pyrealsense2 USB 이중 점유 방지) ───────────
     gui_node = Node(
         package='dsr_realsense_pick_place',
         executable='gui_node',
         name='pick_place_gui',
         output='screen',
-        parameters=[params_file],
+        parameters=[
+            params_file,
+            {'use_local_yolo': False},
+        ],
         condition=IfCondition(LaunchConfiguration('gui')),
     )
 

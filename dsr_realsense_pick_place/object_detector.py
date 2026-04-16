@@ -29,6 +29,7 @@ import json
 import rclpy
 from rclpy.node import Node
 import rclpy.duration
+from rclpy.qos import qos_profile_sensor_data
 import numpy as np
 import cv2
 import pyrealsense2 as rs
@@ -79,23 +80,6 @@ class ObjectDetectorNode(Node):
         # 값이 작을수록 이상치 기준이 엄격해져 더 많은 샘플이 제거된다.
         self.declare_parameter('depth_outlier_mad_scale', 2.5)
         self.declare_parameter('selected_object_topic', '/selected_object_label')
-        # absolute_origin_in_camera_*:
-        # 절대좌표계 원점이 카메라 좌표계에서 어디에 있는지(m) 지정.
-        # 예) 원점이 카메라 기준 (-0.80, 0.0, -0.96)이면
-        #     물체 절대좌표 = 물체카메라좌표 - 원점카메라좌표
-        #                  = (x - (-0.80), y - 0.0, z - (-0.96))
-        self.declare_parameter('absolute_origin_in_camera_x_m', -0.80)
-        self.declare_parameter('absolute_origin_in_camera_y_m', 0.0)
-        self.declare_parameter('absolute_origin_in_camera_z_m', -0.96)
-        # absolute_calib_*_mm:
-        # 절대좌표 계산 후 추가로 더하는 축별 보정값(mm).
-        # 기본값: X -20mm, Y -20mm, Z +140mm
-        self.declare_parameter('absolute_calib_x_mm', -20.0)
-        self.declare_parameter('absolute_calib_y_mm', -20.0)
-        self.declare_parameter('absolute_calib_z_mm', 140.0)
-        # True면 위 원점 오프셋으로 절대좌표를 계산하고,
-        # False면 기존처럼 TF 카메라→베이스 변환을 사용한다.
-        self.declare_parameter('use_manual_absolute_origin', True)
 
         p = self.get_parameter
         # 자주 쓰는 파라미터는 멤버 변수로 꺼내 두고 이후 계산에 재사용한다.
@@ -110,13 +94,6 @@ class ObjectDetectorNode(Node):
         self.depth_r = p('depth_sample_radius').value
         self.depth_center_ratio = p('depth_center_ratio').value
         self.depth_outlier_mad_scale = p('depth_outlier_mad_scale').value
-        self.abs_origin_cam_x = p('absolute_origin_in_camera_x_m').value
-        self.abs_origin_cam_y = p('absolute_origin_in_camera_y_m').value
-        self.abs_origin_cam_z = p('absolute_origin_in_camera_z_m').value
-        self.abs_calib_x_m = float(p('absolute_calib_x_mm').value) / 1000.0
-        self.abs_calib_y_m = float(p('absolute_calib_y_mm').value) / 1000.0
-        self.abs_calib_z_m = float(p('absolute_calib_z_mm').value) / 1000.0
-        self.use_manual_absolute_origin = p('use_manual_absolute_origin').value
         self.selected_object_label = ''
         self.last_logged_selected_label = None
 
@@ -145,13 +122,22 @@ class ObjectDetectorNode(Node):
         # 이렇게 해야 서로 다른 시점의 프레임이 섞여 3D 좌표가 흔들리는 문제를 방지한다.
         # (예: t=0의 컬러에 t=0.2의 depth를 쓰면 움직이는 물체의 좌표가 틀릴 수 있음)
         self.color_sub = message_filters.Subscriber(
-            self, Image, p('color_topic').value
+            self,
+            Image,
+            p('color_topic').value,
+            qos_profile=qos_profile_sensor_data,
         )
         self.depth_sub = message_filters.Subscriber(
-            self, Image, p('depth_topic').value
+            self,
+            Image,
+            p('depth_topic').value,
+            qos_profile=qos_profile_sensor_data,
         )
         self.info_sub = message_filters.Subscriber(
-            self, CameraInfo, p('camera_info_topic').value
+            self,
+            CameraInfo,
+            p('camera_info_topic').value,
+            qos_profile=qos_profile_sensor_data,
         )
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [self.color_sub, self.depth_sub, self.info_sub],
@@ -168,8 +154,9 @@ class ObjectDetectorNode(Node):
         self.pub_selected_pose = self.create_publisher(PoseStamped,
                                                        '/selected_object_pose', 10)
         self.pub_objects = self.create_publisher(String, '/detected_objects', 10)
-        self.pub_debug = self.create_publisher(Image,
-                                               '/detection_debug_image', 10)
+        self.pub_debug = self.create_publisher(
+            Image, '/detection_debug_image', qos_profile_sensor_data
+        )
 
         self.get_logger().info('컬러/뎁스/카메라정보 토픽 동기화 대기 중...')
         self.get_logger().info('ObjectDetectorNode 시작')
@@ -285,20 +272,21 @@ class ObjectDetectorNode(Node):
                         (u - w // 2, v - h // 2 - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            # RealSense 픽셀 좌표를 카메라 3D 좌표로 바꾼 뒤 절대좌표로 변환한다.
+            # RealSense 픽셀 좌표를 카메라 3D 좌표로 바꾼 뒤,
+            # TF를 이용해 로봇 베이스 좌표계까지 변환한다.
             pose_cam = self._pixel_to_camera_pose(u, v, depth_m)
-            pose_abs = self._to_absolute_pose(pose_cam)
-            if pose_abs is None:
+            pose_base = self._transform_to_base(pose_cam)
+            if pose_base is None:
                 continue
 
-            pos = pose_abs.pose.position
+            pos = pose_base.pose.position
             candidates.append({
                 'label': label,
                 'confidence': conf,
                 'depth_m': depth_m,
                 'pixel_u': u,
                 'pixel_v': v,
-                'pose': pose_abs,
+                'pose': pose_base,
                 'pose_dict': {
                     'x': pos.x,
                     'y': pos.y,
@@ -317,12 +305,12 @@ class ObjectDetectorNode(Node):
             return
 
         # 선택 결과는 "일반 검출 결과"와 "실제 pick 대상으로 쓸 결과"를 둘 다 발행한다.
-        pose_abs = selected['pose']
-        pos = pose_abs.pose.position
-        self.pub_pose.publish(pose_abs)
-        self.pub_selected_pose.publish(pose_abs)
+        pose_base = selected['pose']
+        pos = pose_base.pose.position
+        self.pub_pose.publish(pose_base)
+        self.pub_selected_pose.publish(pose_base)
         self.get_logger().info(
-            f'[{selected["label"]}] 절대좌표: '
+            f'[{selected["label"]}] 로봇베이스 좌표: '
             f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m'
         )
 
@@ -397,10 +385,10 @@ class ObjectDetectorNode(Node):
         RealSense SDK의 rs2_deproject_pixel_to_point()는 핀홀 모델 + 왜곡 보정을 적용해
         픽셀 좌표를 카메라 광학 좌표계(camera_color_optical_frame)의 3D 점으로 변환한다.
 
-        이 프로젝트에서는 optical frame 축을 다음과 같이 재정의해 사용한다.
-          X: 왼쪽 (+)   [기본 optical X(오른쪽 +)의 반대]
-          Y: 아래쪽 (+) [기본 optical Y와 동일]
-          Z: 카메라 뒤쪽 (+) [기본 optical Z(앞쪽 +)의 반대]
+        카메라 광학 좌표계 (REP-103 기준):
+          X: 오른쪽 (+)
+          Y: 아래쪽 (+)
+          Z: 카메라 앞쪽 (+, depth 방향)
         """
         # rs2_deproject_pixel_to_point: (intrinsics, [u, v], depth_m) → [X, Y, Z]
         # 내부적으로 수식: X = (u - ppx) / fx * Z, Y = (v - ppy) / fy * Z
@@ -409,8 +397,6 @@ class ObjectDetectorNode(Node):
             [float(u), float(v)],
             float(depth_m),
         )
-        X = -X
-        Z = -Z
 
         ps = PoseStamped()
         ps.header.frame_id = self.camera_frame   # 'camera_color_optical_frame'
@@ -448,33 +434,6 @@ class ObjectDetectorNode(Node):
         except Exception as e:
             self.get_logger().warn(f'TF 변환 실패: {e}')
             return None
-
-    def _to_absolute_pose(self, pose_cam: PoseStamped):
-        """카메라 좌표를 절대좌표로 변환한다.
-
-        use_manual_absolute_origin=True:
-          절대원점의 카메라좌표(ox, oy, oz)를 사용해
-          p_abs = p_cam - o_cam
-        use_manual_absolute_origin=False:
-          기존 TF(camera -> robot_base_frame) 변환 사용
-        """
-        if not self.use_manual_absolute_origin:
-            return self._transform_to_base(pose_cam)
-
-        pose_abs = PoseStamped()
-        pose_abs.header = pose_cam.header
-        pose_abs.header.frame_id = 'absolute_frame'
-        pose_abs.pose.position.x = (
-            pose_cam.pose.position.x - self.abs_origin_cam_x + self.abs_calib_x_m
-        )
-        pose_abs.pose.position.y = (
-            pose_cam.pose.position.y - self.abs_origin_cam_y + self.abs_calib_y_m
-        )
-        pose_abs.pose.position.z = (
-            pose_cam.pose.position.z - self.abs_origin_cam_z + self.abs_calib_z_m
-        )
-        pose_abs.pose.orientation = pose_cam.pose.orientation
-        return pose_abs
 
     def _publish_detected_objects(self, candidates: list):
         # GUI가 별도 커스텀 메시지 없이 바로 읽을 수 있도록 JSON 문자열로 묶어 발행한다.
