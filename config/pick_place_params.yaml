@@ -15,12 +15,12 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "yolov8n.pt"        # yolov8n/s/m/l/x.pt 중 선택
+    yolo_model: "~/doosan_ws/src/mini_project/best.pt"
     confidence_threshold: 0.5
 
     # 인식할 클래스 목록 (빈 리스트이면 모든 클래스)
     # COCO 클래스 이름 사용: https://docs.ultralytics.com/datasets/detect/coco/
-    target_classes: ["bottle", "cup", "bowl", "sports ball", "orange", "apple"]
+    target_classes: ["doll", "pack", "pencil", "tape", "cup"]
 
     # --- Depth 파라미터 ---
     depth_scale: 0.001              # mm → m (RealSense 기본값)
@@ -31,11 +31,30 @@ object_detector:
     depth_outlier_mad_scale: 2.5    # MAD 이상치 제거 스케일 팩터
     selected_object_topic: "/selected_object_label"
 
+
+        # ★ 아래 내용 추가 ★
+    # --- 좌표 변환 모드 ---
+    # true: 수동 원점 오프셋 방식 (TF 없이 동작, 캘리브레이션 필요)
+    # false: TF2 방식 (static TF가 정확히 설정된 경우 사용)
+    use_manual_absolute_origin: True   # 일단 TF 방식으로 시작
+
+    # --- 수동 절대좌표 원점 (use_manual_absolute_origin: true 일 때 사용) ---
+    # 카메라 좌표계 기준 로봇 base_link 원점의 위치 (m)
+    # 실측 후 채워넣기
+    absolute_origin_in_camera_x_m: -0.80
+    absolute_origin_in_camera_y_m: 0.0
+    absolute_origin_in_camera_z_m: -0.96
+
+    # --- 보정값 (mm) ---
+    absolute_calib_x_mm: -20.0
+    absolute_calib_y_mm: -20.0
+    absolute_calib_z_mm: 140.0
+
 # ─── 기존 내용 아래에 추가 ───────────────────────────────────────────
 
 rh_p12_rna_gripper:
   ros__parameters:
-    robot_ns: ""      
+    robot_ns: "dsr01"      
     stroke_close: 1000        
     motion_wait: 1.5           
     svc_timeout: 10.0

@@ -148,7 +148,8 @@ class GripperNode(Node):
         self._mot_wait  = self.get_parameter('motion_wait').value
 
         # ── 서비스 클라이언트 (DrlStart 하나만 사용) ──────────────
-        prefix = f'/{ns}' if ns else ''
+        ns = self.get_parameter('robot_ns').value or 'dsr01'
+        prefix = f'/{ns}'
         self._cli_drl = self.create_client(
             DrlStart, f'{prefix}/drl/drl_start',
             callback_group=cb)
@@ -243,7 +244,7 @@ class GripperNode(Node):
 
         # drl_start 서비스 연결 대기
         waited = 0.0
-        while not self._cli_drl.service_is_ready() and waited < 10.0:
+        while not self._cli_drl.service_is_ready() and waited < 30.0:
             time.sleep(0.5)
             waited += 0.5
         if not self._cli_drl.service_is_ready():

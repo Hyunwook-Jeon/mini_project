@@ -1,23 +1,5 @@
 """
 pick_place.launch.py
---------------------
-전체 Pick & Place 시스템 런치:
-  1. Doosan E0509 로봇 (MoveIt 포함)
-  2. RealSense 카메라
-  3. 카메라→로봇 정적 TF
-  4. 객체 검출 노드
-  5. Pick & Place 상태머신 노드
-  6. GUI (선택)
-
-사용법:
-  # 가상 모드 (에뮬레이터)
-  ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=virtual
-
-  # 실제 로봇
-  ros2 launch dsr_realsense_pick_place pick_place.launch.py mode:=real host:=192.168.1.100
-
-  # RealSense 없이 테스트 (카메라 노드 스킵)
-  ros2 launch dsr_realsense_pick_place pick_place.launch.py use_realsense:=false
 """
 
 import os
@@ -25,6 +7,7 @@ import os
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     IncludeLaunchDescription,
     TimerAction,
 )
@@ -36,9 +19,7 @@ from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 
 
-# ── 런치 인수 ──────────────────────────────────────────────────────────
 ARGUMENTS = [
-    # 로봇
     DeclareLaunchArgument('mode',  default_value='virtual',
                           description='virtual | real'),
     DeclareLaunchArgument('host',  default_value='127.0.0.1',
@@ -49,22 +30,17 @@ ARGUMENTS = [
                           description='Doosan 모델명'),
     DeclareLaunchArgument('color', default_value='white',
                           description='로봇 색상'),
-    # 카메라
     DeclareLaunchArgument('use_realsense', default_value='true',
                           description='RealSense 카메라 노드 실행 여부'),
     DeclareLaunchArgument('camera_serial', default_value='',
-                          description='RealSense 시리얼 번호 (비어있으면 자동)'),
-    # TF: 카메라→로봇 베이스 (hand-eye 캘리브레이션 결과 입력)
-    # 아래 값은 예시 (실제 측정값으로 교체 필요!)
-    # 단위: translation=m, rotation=quaternion (x y z w)
-    DeclareLaunchArgument('cam_tf_x', default_value='0.5'),
-    DeclareLaunchArgument('cam_tf_y', default_value='0.0'),
-    DeclareLaunchArgument('cam_tf_z', default_value='0.6'),
+                          description='RealSense 시리얼 번호'),
+    DeclareLaunchArgument('cam_tf_x',  default_value='0.5'),
+    DeclareLaunchArgument('cam_tf_y',  default_value='0.0'),
+    DeclareLaunchArgument('cam_tf_z',  default_value='0.6'),
     DeclareLaunchArgument('cam_tf_qx', default_value='0.0'),
     DeclareLaunchArgument('cam_tf_qy', default_value='0.707'),
     DeclareLaunchArgument('cam_tf_qz', default_value='0.0'),
     DeclareLaunchArgument('cam_tf_qw', default_value='0.707'),
-    # 기타
     DeclareLaunchArgument('gui', default_value='true',
                           description='PyQt GUI 실행 여부'),
 ]
@@ -72,18 +48,17 @@ ARGUMENTS = [
 
 def generate_launch_description():
 
-    # 설치된 패키지의 share 디렉터리에서 설정 파일 경로를 찾는다.
-    pkg_this = get_package_share_directory('dsr_realsense_pick_place')
+    pkg_this    = get_package_share_directory('dsr_realsense_pick_place')
     params_file = os.path.join(pkg_this, 'config', 'pick_place_params.yaml')
 
-    # ── 1. Doosan 로봇 bringup (MoveIt 포함) ───────────────────────────
-    doosan_moveit = IncludeLaunchDescription(
+    # ── 1. Doosan bringup (rviz 버전) ──────────────────────────────────
+    # moveit 버전은 내부 컨트롤러가 달라 move_joint success=False 발생
+    doosan_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             FindPackageShare('dsr_bringup2'),
-            '/launch/dsr_bringup2_moveit.launch.py'
+            '/launch/dsr_bringup2_rviz.launch.py'   # ← moveit → rviz
         ]),
         launch_arguments={
-            # 여기서 넘긴 값이 dsr_bringup2 쪽 launch 인수로 그대로 전달된다.
             'mode':  LaunchConfiguration('mode'),
             'host':  LaunchConfiguration('host'),
             'port':  LaunchConfiguration('port'),
@@ -93,14 +68,30 @@ def generate_launch_description():
         }.items(),
     )
 
-    # ── 2. RealSense 카메라 ────────────────────────────────────────────
+    # ── 2. robot_mode=1 설정 (bringup 6초 후) ──────────────────────────
+    # pick_place_node 내부에서도 설정하지만, launch 단계에서도 보장
+    set_robot_mode = TimerAction(
+        period=10.0,
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    'ros2', 'service', 'call',
+                    '/dsr01/system/set_robot_mode',
+                    'dsr_msgs2/srv/SetRobotMode',
+                    '{robot_mode: 1}',
+                ],
+                output='screen',
+            )
+        ]
+    )
+
+    # ── 3. RealSense 카메라 ─────────────────────────────────────────────
     realsense_node = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             FindPackageShare('realsense2_camera'),
             '/launch/rs_launch.py'
         ]),
         launch_arguments={
-            # 검출은 컬러 이미지 중심으로 하므로 depth를 color 프레임에 맞춘다.
             'align_depth.enable': 'true',
             'pointcloud.enable':  'true',
             'serial_no':          LaunchConfiguration('camera_serial'),
@@ -108,19 +99,12 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('use_realsense')),
     )
 
-    # ── 3. 카메라 → 로봇 베이스 정적 TF ──────────────────────────────
-    # eye-to-hand 구성 (외부 고정 카메라):
-    #   base_link  ← [static TF] ←  camera_color_optical_frame
-    #
-    # ※ 실제 값은 hand-eye 캘리브레이션 후 교체:
-    #   ros2 run easy_handeye2 calibrate ...
-    #   또는 직접 줄자로 측정
-    static_tf_cam_to_base = Node(
+    # ── 4. 카메라 → 베이스 정적 TF ─────────────────────────────────────
+    static_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='camera_to_base_tf',
         arguments=[
-            # x y z qx qy qz qw  parent_frame  child_frame
             LaunchConfiguration('cam_tf_x'),
             LaunchConfiguration('cam_tf_y'),
             LaunchConfiguration('cam_tf_z'),
@@ -134,7 +118,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # ── 4. 객체 검출 노드 ──────────────────────────────────────────────
+    # ── 5. 객체 검출 노드 ───────────────────────────────────────────────
     object_detector = Node(
         package='dsr_realsense_pick_place',
         executable='object_detector',
@@ -143,7 +127,8 @@ def generate_launch_description():
         parameters=[params_file],
     )
 
-    # GUI만 ROS 디버그 영상(yaml 기본은 로컬 best.pt — 여기서 false 로 덮어씀).
+    # ── 6. GUI 노드 (전체 런치에서는 use_local_yolo=false 로 덮어써
+    #     realsense2_camera 와 pyrealsense2 USB 이중 점유 방지) ───────────
     gui_node = Node(
         package='dsr_realsense_pick_place',
         executable='gui_node',
@@ -156,28 +141,26 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('gui')),
     )
 
-
-    # ── 5. Gripper 노드 (로봇 bringup 후 5초 지연 시작) ──────────────────
+    # ── 7. Gripper 노드 (5초 후) ────────────────────────────────────────
     gripper = TimerAction(
-        period=5.0,
+        period=10.0,
         actions=[
             Node(
                 package='dsr_realsense_pick_place',
                 executable='gripper_node',
                 name='rh_p12_rna_gripper',
                 output='screen',
-                parameters=[
-                    params_file,
-                    {'robot_ns':''}
-                ]
+                parameters=[params_file, 
+                            {'robot_ns': 'dsr01'}],
             )
         ]
     )
 
-    # ── 5. Pick & Place 노드 (로봇 bringup 후 5초 지연 시작) ──────────
+    # ── 8. Pick & Place 노드 (12초 후) ─────────────────────────────────
+    # 타이밍: 0초 bringup → 6초 set_robot_mode → 12초 pick_place_node 시작
+    # pick_place_node 내부 _wait_for_services()에서 추가로 3초 대기 후 재확인
     pick_place = TimerAction(
-        period=10.0,
-        # 로봇 서비스가 올라오기 전에 상태머신이 먼저 시작되지 않도록 잠시 대기한다.
+        period=12.0,
         actions=[
             Node(
                 package='dsr_realsense_pick_place',
@@ -189,13 +172,13 @@ def generate_launch_description():
         ]
     )
 
-    # 최종 LaunchDescription 에 각 액션을 순서대로 담아 반환한다.
     return LaunchDescription(ARGUMENTS + [
-        doosan_moveit,
-        realsense_node,
-        static_tf_cam_to_base,
-        object_detector,
-        gui_node,
-        gripper,
-        pick_place,
+        doosan_bringup,       # 0초: 로봇 드라이버 + rviz
+        set_robot_mode,       # 6초: robot_mode=1
+        realsense_node,       # 즉시: 카메라
+        static_tf,            # 즉시: TF
+        object_detector,      # 즉시: YOLO 검출
+        gui_node,             # 즉시: GUI (조건부)
+        gripper,              # 5초: 그리퍼 노드
+        pick_place,           # 12초: 상태머신
     ])

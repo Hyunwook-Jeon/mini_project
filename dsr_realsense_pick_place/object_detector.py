@@ -166,6 +166,9 @@ class ObjectDetectorNode(Node):
     # ────────────────────────────────────────────────────────────────────
     def _load_yolo(self):
         model_name = self.get_parameter('yolo_model').value
+        
+        import os
+        model_name = os.path.expandvars(os.path.expanduser(model_name))
         try:
             from ultralytics import YOLO
             # model_name 이 파일 경로면 로컬 파일을, 문자열이면 기본 weight 이름을 읽는다.
