@@ -25,6 +25,7 @@ Doosan 서비스 클라이언트 (namespace: /dsr01/):
 import threading
 import time
 from enum import Enum, auto
+import math # For math.degrees
 
 import rclpy
 from rclpy.node import Node
@@ -32,6 +33,7 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Int32, String
 from std_srvs.srv import Trigger
 
+from tf_transformations import euler_from_quaternion # For quaternion to Euler conversion
 from dsr_msgs2.srv import MoveJoint, MoveLine, SerialSendData
 
 
@@ -86,8 +88,8 @@ class PickPlaceNode(Node):
         self.declare_parameter('rh12_close_stroke',           0)
         self.declare_parameter('rh12_port',                   1)
         self.declare_parameter('rh12_init_wait_sec',          0.1)
-        self.declare_parameter('pre_pick_z_offset',           0.12)
-        self.declare_parameter('pick_z_offset',               0.005)
+        self.declare_parameter('pre_pick_z_offset',           0.14)
+        self.declare_parameter('pick_z_offset',               0.015)
         self.declare_parameter('grasp_rpy',                   [0.0, 180.0, 0.0])
         self.declare_parameter('place_position',              [0.4, -0.3, 0.1])
         self.declare_parameter('pre_place_z_offset',          0.15)
@@ -99,6 +101,7 @@ class PickPlaceNode(Node):
         self.declare_parameter('workspace_z_min',             0.0)
         self.declare_parameter('workspace_z_max',             0.60)
         self.declare_parameter('target_pose_topic',           '/selected_object_pose')
+        self.declare_parameter('selected_object_topic',       '/selected_object_label')
 
         ns = self.get_parameter('robot_namespace').value
         self.jvel         = self.get_parameter('joint_vel').value
@@ -155,6 +158,9 @@ class PickPlaceNode(Node):
         self.state       = State.IDLE
         self.state_lock  = threading.Lock()
         self.target_pose: PoseStamped | None = None
+        self.current_grasp_rpy = list(self.grasp_rpy) # Initialize with default, will be updated dynamically
+        self.pick_requested = False
+        self.pending_command: str | None = None
         self.rh12_initialized = False
         # rh12_lock: Open/Close 거의 동시 호출 시 Modbus 프레임 중복 발송 방지
         self.rh12_lock   = threading.Lock()
@@ -162,10 +168,17 @@ class PickPlaceNode(Node):
         # ── 퍼블리셔 / 구독 ─────────────────────────────────────────────
         self.pub_state       = self.create_publisher(String, '/pick_place_state', 10)
         self.pub_rh12_stroke = self.create_publisher(Int32,  self.rh12_bridge_topic, 10)
+        self.pub_selected    = self.create_publisher(
+            String,
+            self.get_parameter('selected_object_topic').value,
+            10,
+        )
         self.create_subscription(
             PoseStamped,
             self.get_parameter('target_pose_topic').value,
             self._cb_pose, 10)
+        self.create_service(Trigger, '/pick_place/run_once', self._srv_run_once)
+        self.create_service(Trigger, '/pick_place/go_home', self._srv_go_home)
 
         # ── 상태머신 스레드 ─────────────────────────────────────────────
         # daemon=True: 메인 스레드(rclpy.spin) 종료 시 자동으로 함께 종료
@@ -224,10 +237,47 @@ class PickPlaceNode(Node):
     def _cb_pose(self, msg: PoseStamped):
         with self.state_lock:
             # DETECTING 상태일 때만 새 타겟을 수신해 다음 단계로 넘어간다
-            if self.state == State.DETECTING:
+            if self.state == State.DETECTING and self.pick_requested:
                 pos = msg.pose.position
                 if self._in_workspace(pos.x, pos.y, pos.z):
                     self.target_pose = msg
+
+                    # Extract orientation from the received PoseStamped message
+                    quat_x = msg.pose.orientation.x
+                    quat_y = msg.pose.orientation.y
+                    quat_z = msg.pose.orientation.z
+                    quat_w = msg.pose.orientation.w
+
+                    # Convert quaternion to Euler angles (Roll, Pitch, Yaw) in radians
+                    # The order of RPY from euler_from_quaternion is (roll, pitch, yaw)
+                    _, _, yaw_rad = euler_from_quaternion([quat_x, quat_y, quat_z, quat_w])
+
+                    # --- 최단 경로 회전각 최적화 로직 ---
+                    # 그리퍼는 180도 대칭이므로, yaw 와 yaw+180 두 방향으로 잡을 수 있습니다.
+                    # 이 로직은 현재 로봇의 회전량이 최소가 되는 각도를 선택합니다.
+                    yaw_deg = math.degrees(yaw_rad)
+
+                    # 두 등가 각도(현재각, 180도 회전각)를 [-180, 180] 범위로 정규화합니다.
+                    # 예: 170도 -> [170, -10], -170도 -> [-170, 10]
+                    yaw1_norm = (yaw_deg + 180) % 360 - 180
+                    yaw2_norm = (yaw_deg + 180 + 180) % 360 - 180
+
+                    # "역방향 회전 불가" 제약을 고려한 최적 각도 선택:
+                    # 로봇이 비효율적으로 크게 도는 것을 막기 위해, 0도에서 가장 가까운 각도를 선택합니다.
+                    # 만약 선택된 각도가 -10도라면, 이는 "반대로 10도" 도는 것이 아니라,
+                    # "시계방향으로 10도" 도는 최단 경로를 의미합니다. 이것이 가장 효율적인 움직임입니다.
+                    # 만약 케이블 꼬임 등 물리적 제약으로 시계방향 회전이 절대 불가하다면, 이 로직을 수정해야 합니다.
+                    if abs(yaw1_norm) <= abs(yaw2_norm):
+                        final_yaw_deg = yaw1_norm
+                    else:
+                        final_yaw_deg = yaw2_norm
+
+                    self.get_logger().info(
+                        f"Yaw 최적화: 원본 {yaw_deg:.1f}° → 두 후보 [{yaw1_norm:.1f}°, {yaw2_norm:.1f}°] → 최종 선택: {final_yaw_deg:.1f}°"
+                    )
+
+                    # 고정된 Roll/Pitch와 최적화된 Yaw를 조합
+                    self.current_grasp_rpy = [self.grasp_rpy[0], self.grasp_rpy[1], final_yaw_deg]
                     self.state = State.PRE_PICK
                     self.get_logger().info(
                         f'목표 설정: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}')
@@ -246,6 +296,15 @@ class PickPlaceNode(Node):
     # ────────────────────────────────────────────────────────────────────
     def _state_machine_loop(self):
         while rclpy.ok():
+            command = self._pop_pending_command()
+            if command is not None:
+                try:
+                    self._execute_manual_command(command)
+                except Exception as e:
+                    self.get_logger().error(f'수동 명령 예외({command}): {e}')
+                    self._set_state(State.ERROR)
+                continue
+
             with self.state_lock:
                 current = self.state
 
@@ -254,9 +313,7 @@ class PickPlaceNode(Node):
 
             try:
                 if current == State.IDLE:
-                    self.get_logger().info('홈으로 이동 후 DETECTING 대기...')
-                    self._go_home()
-                    self._set_state(State.DETECTING)
+                    time.sleep(0.1)
 
                 elif current == State.DETECTING:
                     time.sleep(0.1)  # 포즈 콜백 대기 (CPU 점유 최소화)
@@ -270,7 +327,7 @@ class PickPlaceNode(Node):
                         pose.pose.position.x,
                         pose.pose.position.y,
                         pose.pose.position.z + self.pre_pick_dz,
-                        self.grasp_rpy)
+                        self.current_grasp_rpy) # Use dynamic RPY
                     self._set_state(State.PICK)
 
                 elif current == State.PICK:
@@ -281,7 +338,7 @@ class PickPlaceNode(Node):
                         pose.pose.position.x,
                         pose.pose.position.y,
                         pose.pose.position.z + self.pick_dz,
-                        self.grasp_rpy, vel=50.0, acc=100.0)
+                        self.current_grasp_rpy, vel=50.0, acc=100.0) # Use dynamic RPY
                     self._gripper_close()
                     self._set_state(State.LIFT)
 
@@ -293,7 +350,7 @@ class PickPlaceNode(Node):
                         pose.pose.position.x,
                         pose.pose.position.y,
                         pose.pose.position.z + self.pre_pick_dz,
-                        self.grasp_rpy)
+                        self.current_grasp_rpy) # Use dynamic RPY
                     self._set_state(State.MOVE_TO_PLACE)
 
                 elif current == State.MOVE_TO_PLACE:
@@ -318,7 +375,7 @@ class PickPlaceNode(Node):
 
                 elif current == State.HOME:
                     self._go_home()
-                    self._set_state(State.IDLE)
+                    self._finish_cycle()
 
                 elif current == State.ERROR:
                     self.get_logger().error('오류 발생. 수동 복구 필요.')
@@ -332,6 +389,87 @@ class PickPlaceNode(Node):
         with self.state_lock:
             self.state = s
         self.get_logger().info(f'→ 상태 전환: {s.name}')
+
+    def _enqueue_command(self, command: str) -> bool:
+        with self.state_lock:
+            if self.pending_command is not None:
+                return False
+            self.pending_command = command
+        return True
+
+    def _pop_pending_command(self) -> str | None:
+        with self.state_lock:
+            command = self.pending_command
+            self.pending_command = None
+        return command
+
+    def _execute_manual_command(self, command: str):
+        if command == 'run_once':
+            self.get_logger().info('1회 Pick & Place 요청 수신')
+            self._clear_target()
+            self.pick_requested = True
+            self._set_state(State.HOME)
+            self._go_home()
+            self._set_state(State.DETECTING)
+            return
+
+        if command == 'go_home':
+            self.get_logger().info('수동 홈 이동 요청 수신')
+            self.pick_requested = False
+            self._clear_target()
+            self._clear_selected_label()
+            self._set_state(State.HOME)
+            self._go_home()
+            self._set_state(State.IDLE)
+            return
+
+        raise RuntimeError(f'알 수 없는 명령: {command}')
+
+    def _clear_target(self):
+        with self.state_lock:
+            self.target_pose = None
+
+    def _finish_cycle(self):
+        self.pick_requested = False
+        self._clear_target()
+        self._clear_selected_label()
+        self._set_state(State.IDLE)
+
+    def _clear_selected_label(self):
+        msg = String()
+        msg.data = ''
+        self.pub_selected.publish(msg)
+
+    def _srv_run_once(self, _, res: Trigger.Response):
+        with self.state_lock:
+            busy = self.state != State.IDLE or self.pending_command is not None
+        if busy:
+            res.success = False
+            res.message = '현재 작업 중이어서 1회 실행을 시작할 수 없습니다.'
+            return res
+        if not self._enqueue_command('run_once'):
+            res.success = False
+            res.message = '대기 중인 명령이 있습니다.'
+            return res
+        res.success = True
+        res.message = '1회 Pick & Place 실행을 예약했습니다.'
+        return res
+
+    def _srv_go_home(self, _, res: Trigger.Response):
+        with self.state_lock:
+            busy_state = self.state not in (State.IDLE, State.DETECTING, State.ERROR)
+            command_pending = self.pending_command is not None
+        if busy_state or command_pending:
+            res.success = False
+            res.message = '현재 모션 수행 중이어서 홈 이동을 예약할 수 없습니다.'
+            return res
+        if not self._enqueue_command('go_home'):
+            res.success = False
+            res.message = '대기 중인 명령이 있습니다.'
+            return res
+        res.success = True
+        res.message = '홈 이동을 예약했습니다.'
+        return res
 
     def _publish_state(self, name: str):
         msg = String()
@@ -571,8 +709,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
