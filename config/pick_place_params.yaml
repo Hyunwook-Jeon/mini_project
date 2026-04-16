@@ -15,8 +15,8 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "~/doosan_ws/src/mini_project/best.pt"
-    confidence_threshold: 0.5
+    yolo_model: "/home/pyw/kairos_ws/src/mini_project/runs/weights/weights/best.pt"
+    confidence_threshold: 0.25
 
     # 인식할 클래스 목록 (빈 리스트이면 모든 클래스)
     # COCO 클래스 이름 사용: https://docs.ultralytics.com/datasets/detect/coco/
@@ -49,7 +49,20 @@ object_detector:
     absolute_calib_x_mm: -20.0
     absolute_calib_y_mm: -20.0
     absolute_calib_z_mm: 140.0
+    use_realsense: true # RealSense 카메라 사용 여부
 
+    # --- PCA 기반 객체 방향/크기 추정 파라미터 ---
+    device: "cpu"
+    pca_z_band_m: 0.045
+    pca_ellipse_scale: 0.38
+    pca_step: 4
+    use_fastsam_for_pca: false
+    fastsam_weights: "" # 예: FastSAM-s.pt
+    use_seg_aux_for_pca: false
+    seg_aux_weights: "" # 예: yolov8n-seg.pt
+    seg_aux_imgsz: 640
+    seg_crop_pad: 0.15
+    no_depth_pca_fallback: false
 # ─── 기존 내용 아래에 추가 ───────────────────────────────────────────
 
 rh_p12_rna_gripper:
@@ -60,6 +73,10 @@ rh_p12_rna_gripper:
     svc_timeout: 10.0
     init_current: 400
     cube_current: 300
+
+pick_place_gui:
+  ros__parameters:
+    use_local_yolo: false
     
 pick_place_node:
   ros__parameters:
@@ -76,7 +93,9 @@ pick_place_node:
     home_joints: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
 
     # --- 그리퍼 설정 ---
-    gripper_wait_sec: 0.1           # 그리퍼 동작 대기 시간 (s)
+    # gripper_node의 motion_wait(1.5s)보다 길게 설정해야
+    # 그리퍼 동작 완료 후 다음 로봇 모션이 시작됩니다.
+    gripper_wait_sec: 1.7           # 그리퍼 동작 대기 시간 (s)
 
     # --- ROBOTIS RH-P12-Rn 설정 ---
     rh12_serial_service: "/dsr01/gripper/serial_send_data"
@@ -93,8 +112,8 @@ pick_place_node:
     rh12_init_wait_sec: 0.1
 
     # --- Pick 파라미터 ---
-    pre_pick_z_offset: 0.12         # Pick 위 대기 높이 오프셋 (m)
-    pick_z_offset: 0.005            # 실제 픽 높이 보정 (m)
+    pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)
+    pick_z_offset: 0.015            # 실제 픽 높이 보정 (m)
     grasp_rpy: [0.0, 180.0, 0.0]    # 그리퍼 자세 (rx, ry, rz deg)
                                     # [0, 180, 0] = 수직 하강
 
@@ -112,21 +131,3 @@ pick_place_node:
     workspace_z_min: 0.0
     workspace_z_max: 0.60
     target_pose_topic: "/selected_object_pose"
-
-# --- GUI (ros2 run gui_node / launch 시 pick_place_gui) ---
-# weights_path: 패키지 루트 기준 상대경로 (학습 산출 best.pt)
-# use_local_yolo: true 기본 — best.pt 로컬 YOLO + use_realsense 시 pyrealsense2.
-# pick_place.launch 는 gui 에만 use_local_yolo:false 를 덮어써 realsense2_camera 와 USB 충돌 방지.
-pick_place_gui:
-  ros__parameters:
-    weights_path: "runs/weights/weights/best.pt"
-    require_best_pt: true
-    # ROS 모드일 때 object_detector 토픽 (SensorData QoS 로 맞춤)
-    debug_image_topic: "/detection_debug_image"
-    detected_objects_topic: "/detected_objects"
-    use_local_yolo: true
-    use_realsense: true
-    rs_serial: ""
-    rs_width: 640
-    rs_height: 480
-    rs_fps: 30
