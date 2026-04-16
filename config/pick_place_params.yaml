@@ -18,6 +18,7 @@ object_detector:
     yolo_model: "/home/hyunwook/ros2_ws/src/mini_project/runs/weights/weights/best.pt"
     confidence_threshold: 0.5
 
+
     # 인식할 클래스 목록 (빈 리스트이면 모든 클래스)
     # COCO 클래스 이름 사용: https://docs.ultralytics.com/datasets/detect/coco/
     target_classes: ["doll", "pack", "pencil", "tape", "cup"]
@@ -51,7 +52,20 @@ object_detector:
     absolute_calib_x_mm: -20.0
     absolute_calib_y_mm: -20.0
     absolute_calib_z_mm: 140.0
+    use_realsense: true # RealSense 카메라 사용 여부
 
+    # --- PCA 기반 객체 방향/크기 추정 파라미터 ---
+    device: "cpu"
+    pca_z_band_m: 0.045
+    pca_ellipse_scale: 0.38
+    pca_step: 4
+    use_fastsam_for_pca: false
+    fastsam_weights: "" # 예: FastSAM-s.pt
+    use_seg_aux_for_pca: false
+    seg_aux_weights: "" # 예: yolov8n-seg.pt
+    seg_aux_imgsz: 640
+    seg_crop_pad: 0.15
+    no_depth_pca_fallback: false
 # ─── 기존 내용 아래에 추가 ───────────────────────────────────────────
 
 rh_p12_rna_gripper:
@@ -85,7 +99,9 @@ pick_place_node:
     home_joints: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
 
     # --- 그리퍼 설정 ---
-    gripper_wait_sec: 0.1           # 그리퍼 동작 대기 시간 (s)
+    # gripper_node의 motion_wait(1.5s)보다 길게 설정해야
+    # 그리퍼 동작 완료 후 다음 로봇 모션이 시작됩니다.
+    gripper_wait_sec: 1.7           # 그리퍼 동작 대기 시간 (s)
 
     # --- ROBOTIS RH-P12-Rn 설정 ---
     rh12_serial_service: "/dsr01/gripper/serial_send_data"

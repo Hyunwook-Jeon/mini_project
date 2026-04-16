@@ -18,6 +18,7 @@
   <depend>message_filters</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
+  <depend>tf_transformations</depend>
   <depend>dsr_msgs2</depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>

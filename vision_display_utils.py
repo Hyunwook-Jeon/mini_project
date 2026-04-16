@@ -1,7 +1,78 @@
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
+
+
+def _normalize_vec_quadrant(v: np.ndarray) -> np.ndarray | None:
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return None
+    return (v / n).astype(np.float64)
+
+
+def quadrant_obj_frame_from_normal(
+    normal: np.ndarray,
+    u: float,
+    v: float,
+    cx: float,
+    cy: float,
+) -> dict:
+    """표면 법선 Z와 (u,v)의 주점 대비 4분면 부호로 접평면 X,Y 단위축을 고른다."""
+    z_axis = _normalize_vec_quadrant(np.asarray(normal, dtype=np.float64))
+    if z_axis is None:
+        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    t1 = np.cross(ref, z_axis)
+    t1 = _normalize_vec_quadrant(t1)
+    if t1 is None:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        t1 = _normalize_vec_quadrant(np.cross(ref, z_axis))
+    if t1 is None:
+        t1 = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    t2 = _normalize_vec_quadrant(np.cross(z_axis, t1))
+    if t2 is None:
+        t2 = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+    sx = 1.0 if u >= cx else -1.0
+    sy = 1.0 if v >= cy else -1.0
+    x_axis = _normalize_vec_quadrant((sx * t1) + (sy * t2))
+    if x_axis is None:
+        x_axis = t1
+    y_axis = _normalize_vec_quadrant(np.cross(z_axis, x_axis))
+    if y_axis is None:
+        y_axis = t2
+
+    return {
+        'source': 'quadrant_fallback',
+        'x_axis_mode': 'quadrant_sign',
+        'axis_x': [float(x_axis[0]), float(x_axis[1]), float(x_axis[2])],
+        'axis_y': [float(y_axis[0]), float(y_axis[1]), float(y_axis[2])],
+        'axis_z': [float(z_axis[0]), float(z_axis[1]), float(z_axis[2])],
+        'std_minor_m': None,
+        'std_major_m': None,
+    }
+
+
+def centroid_cam_from_uv_depth(
+    ux: float,
+    uy: float,
+    z_m: float,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+) -> np.ndarray:
+    """(u,v)+깊이 → project 카메라 좌표 3D 점 (축 원점)."""
+    if not math.isfinite(z_m) or math.isnan(z_m) or z_m <= 0:
+        return np.zeros(3, dtype=np.float64)
+    x_opt = ((float(ux) - cx) / fx) * z_m
+    y_opt = ((float(uy) - cy) / fy) * z_m
+    xc, yc, zc = camera_to_project_camera_coords(x_opt, y_opt, z_m)
+    return np.array([xc, yc, zc], dtype=np.float64)
 
 
 def project_cam_to_pixel(

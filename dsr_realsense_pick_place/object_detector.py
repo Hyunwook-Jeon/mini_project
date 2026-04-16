@@ -31,6 +31,7 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 import rclpy.duration
+from rclpy.qos import qos_profile_sensor_data
 import numpy as np
 import cv2
 import pyrealsense2 as rs
@@ -81,6 +82,7 @@ class ObjectDetectorNode(Node):
         # 값이 작을수록 이상치 기준이 엄격해져 더 많은 샘플이 제거된다.
         self.declare_parameter('depth_outlier_mad_scale', 2.5)
         self.declare_parameter('selected_object_topic', '/selected_object_label')
+
         self.declare_parameter('use_object_yaw_for_grasp', True)
         self.declare_parameter('yaw_axis_reference', 'long')
         self.declare_parameter('yaw_depth_band_m', 0.03)
@@ -116,6 +118,7 @@ class ObjectDetectorNode(Node):
         self.depth_r = p('depth_sample_radius').value
         self.depth_center_ratio = p('depth_center_ratio').value
         self.depth_outlier_mad_scale = p('depth_outlier_mad_scale').value
+
         self.abs_origin_cam_x = p('absolute_origin_in_camera_x_m').value
         self.abs_origin_cam_y = p('absolute_origin_in_camera_y_m').value
         self.abs_origin_cam_z = p('absolute_origin_in_camera_z_m').value
@@ -127,6 +130,7 @@ class ObjectDetectorNode(Node):
         self.yaw_axis_reference = str(p('yaw_axis_reference').value).strip().lower()
         self.yaw_depth_band_m = float(p('yaw_depth_band_m').value)
         self.yaw_min_mask_pixels = int(p('yaw_min_mask_pixels').value)
+
         self.selected_object_label = ''
         self.last_logged_selected_label = None
 
@@ -155,13 +159,22 @@ class ObjectDetectorNode(Node):
         # 이렇게 해야 서로 다른 시점의 프레임이 섞여 3D 좌표가 흔들리는 문제를 방지한다.
         # (예: t=0의 컬러에 t=0.2의 depth를 쓰면 움직이는 물체의 좌표가 틀릴 수 있음)
         self.color_sub = message_filters.Subscriber(
-            self, Image, p('color_topic').value
+            self,
+            Image,
+            p('color_topic').value,
+            qos_profile=qos_profile_sensor_data,
         )
         self.depth_sub = message_filters.Subscriber(
-            self, Image, p('depth_topic').value
+            self,
+            Image,
+            p('depth_topic').value,
+            qos_profile=qos_profile_sensor_data,
         )
         self.info_sub = message_filters.Subscriber(
-            self, CameraInfo, p('camera_info_topic').value
+            self,
+            CameraInfo,
+            p('camera_info_topic').value,
+            qos_profile=qos_profile_sensor_data,
         )
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [self.color_sub, self.depth_sub, self.info_sub],
@@ -178,8 +191,9 @@ class ObjectDetectorNode(Node):
         self.pub_selected_pose = self.create_publisher(PoseStamped,
                                                        '/selected_object_pose', 10)
         self.pub_objects = self.create_publisher(String, '/detected_objects', 10)
-        self.pub_debug = self.create_publisher(Image,
-                                               '/detection_debug_image', 10)
+        self.pub_debug = self.create_publisher(
+            Image, '/detection_debug_image', qos_profile_sensor_data
+        )
 
         self.get_logger().info('컬러/뎁스/카메라정보 토픽 동기화 대기 중...')
         self.get_logger().info('ObjectDetectorNode 시작')
@@ -241,8 +255,10 @@ class ObjectDetectorNode(Node):
     # YOLO 로드
     # ────────────────────────────────────────────────────────────────────
     def _load_yolo(self):
+
         model_name = str(self.get_parameter('yolo_model').value).strip()
         model_name = self._resolve_model_name(model_name)
+
         try:
             from ultralytics import YOLO
             # model_name 이 파일 경로면 로컬 파일을, 문자열이면 기본 weight 이름을 읽는다.
@@ -367,7 +383,7 @@ class ObjectDetectorNode(Node):
                 'depth_m': depth_m,
                 'pixel_u': u,
                 'pixel_v': v,
-                'pose': pose_abs,
+                'pose': pose_base,
                 'pose_dict': {
                     'x': pos.x,
                     'y': pos.y,
@@ -393,10 +409,10 @@ class ObjectDetectorNode(Node):
             return
 
         # 선택 결과는 "일반 검출 결과"와 "실제 pick 대상으로 쓸 결과"를 둘 다 발행한다.
-        pose_abs = selected['pose']
-        pos = pose_abs.pose.position
-        self.pub_pose.publish(pose_abs)
-        self.pub_selected_pose.publish(pose_abs)
+        pose_base = selected['pose']
+        pos = pose_base.pose.position
+        self.pub_pose.publish(pose_base)
+        self.pub_selected_pose.publish(pose_base)
         self.get_logger().info(
             f'[{selected["label"]}] 절대좌표: '
             f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m '

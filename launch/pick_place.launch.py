@@ -22,7 +22,9 @@ from ament_index_python.packages import get_package_share_directory
 ARGUMENTS = [
     DeclareLaunchArgument('mode',  default_value='virtual',
                           description='virtual | real'),
-    DeclareLaunchArgument('host',  default_value='127.0.0.1',
+
+    DeclareLaunchArgument('host',  default_value='110.120.1.50',
+
                           description='로봇 IP (real 모드)'),
     DeclareLaunchArgument('port',  default_value='12345',
                           description='로봇 포트'),
