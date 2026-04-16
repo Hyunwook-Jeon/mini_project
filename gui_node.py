@@ -76,9 +76,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QLibraryInfo
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-
-from std_msgs.msg import Int32, String
-
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from ultralytics import YOLO
 
@@ -124,27 +122,10 @@ class PickPlaceGuiNode(Node):
 
         # GUI는 직접 로봇을 움직이지 않고 "어떤 물체를 집을지"만 알린다.
         self.pub_selected = self.create_publisher(String, '/selected_object_label', 10)
-
-        self.cli_run_once      = self.create_client(Trigger, '/pick_place/run_once')
-        self.cli_go_home       = self.create_client(Trigger, '/pick_place/go_home')
-        self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
+        self.cli_run_once = self.create_client(Trigger, '/pick_place/run_once')
+        self.cli_go_home = self.create_client(Trigger, '/pick_place/go_home')
+        self.cli_gripper_open = self.create_client(Trigger, '/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
-        self.cli_e_stop        = self.create_client(Trigger, '/pick_place/e_stop')
-        self.cli_cancel        = self.create_client(Trigger, '/pick_place/cancel')
-        self.cli_e_stop_reset  = self.create_client(Trigger, '/pick_place/e_stop_reset')
-        self.cli_speed_normal     = self.create_client(Trigger, '/pick_place/speed_normal')
-        self.cli_speed_reduced    = self.create_client(Trigger, '/pick_place/speed_reduced')
-        self.cli_servo_off        = self.create_client(Trigger, '/pick_place/servo_off')
-        self.cli_servo_on         = self.create_client(Trigger, '/pick_place/servo_on')
-        self.cli_safety_normal    = self.create_client(Trigger, '/pick_place/safety_normal')
-        self.cli_safety_backdrive = self.create_client(Trigger, '/pick_place/safety_backdrive')
-
-        # 로봇 하드웨어 상태 / 속도 모드 (pick_place_node 폴링 결과 수신)
-        self.hw_state   = -1   # -1 = unknown
-        self.speed_mode = 0    # 0 = NORMAL
-        self.create_subscription(Int32, '/robot_hw_state',  self._cb_hw_state, 10)
-        self.create_subscription(Int32, '/robot_speed_mode', self._cb_speed_mode, 10)
-
         if self.use_local_yolo:
             self._init_local_yolo()
         else:
@@ -535,12 +516,6 @@ class PickPlaceGuiNode(Node):
         # 상태 문자열은 pick_place_node가 발행하는 값을 그대로 사용한다.
         self.pick_place_state = msg.data
 
-    def _cb_hw_state(self, msg: Int32):
-        self.hw_state = msg.data
-
-    def _cb_speed_mode(self, msg: Int32):
-        self.speed_mode = msg.data
-
     def publish_selected_label(self, label: str):
         # 빈 문자열은 "자동 선택" 모드로 해석된다.
         self.selected_label = label
@@ -592,54 +567,6 @@ class PickPlaceGui(QWidget):
 
         right_panel = QVBoxLayout()
 
-        # ── 긴급 제어 패널 (항상 최상단, 가장 눈에 띄게) ──────────────────
-        emergency_group = QGroupBox('긴급 제어')
-        emergency_layout = QVBoxLayout(emergency_group)
-
-        self.e_stop_button = QPushButton('⛔  긴급 정지  (E-STOP)')
-        self.e_stop_button.setMinimumHeight(54)
-        self.e_stop_button.setStyleSheet(
-            'QPushButton {'
-            '  background-color: #cc0000; color: white;'
-            '  font-size: 16px; font-weight: bold; border-radius: 8px;'
-            '}'
-            'QPushButton:hover { background-color: #ff1a1a; }'
-            'QPushButton:pressed { background-color: #990000; }'
-            'QPushButton:disabled { background-color: #555; color: #999; }'
-        )
-        self.e_stop_button.clicked.connect(self._e_stop)
-
-        self.cancel_button = QPushButton('🚫  태스크 중단')
-        self.cancel_button.setMinimumHeight(38)
-        self.cancel_button.setStyleSheet(
-            'QPushButton {'
-            '  background-color: #e65c00; color: white;'
-            '  font-size: 13px; font-weight: bold; border-radius: 6px;'
-            '}'
-            'QPushButton:hover { background-color: #ff6600; }'
-            'QPushButton:pressed { background-color: #b34700; }'
-            'QPushButton:disabled { background-color: #555; color: #999; }'
-        )
-        self.cancel_button.clicked.connect(self._cancel_task)
-
-        self.e_stop_reset_button = QPushButton('✅  긴급정지 해제')
-        self.e_stop_reset_button.setMinimumHeight(38)
-        self.e_stop_reset_button.setStyleSheet(
-            'QPushButton {'
-            '  background-color: #1a7a1a; color: white;'
-            '  font-size: 13px; font-weight: bold; border-radius: 6px;'
-            '}'
-            'QPushButton:hover { background-color: #22aa22; }'
-            'QPushButton:pressed { background-color: #115511; }'
-            'QPushButton:disabled { background-color: #555; color: #999; }'
-        )
-        self.e_stop_reset_button.clicked.connect(self._e_stop_reset)
-        self.e_stop_reset_button.setEnabled(False)
-
-        emergency_layout.addWidget(self.e_stop_button)
-        emergency_layout.addWidget(self.cancel_button)
-        emergency_layout.addWidget(self.e_stop_reset_button)
-
         status_group = QGroupBox('상태')
         status_layout = QVBoxLayout(status_group)
         self.state_label = QLabel('Pick & Place 상태: IDLE')
@@ -661,120 +588,6 @@ class PickPlaceGui(QWidget):
         control_layout.addWidget(self.gripper_open_button)
         control_layout.addWidget(self.gripper_close_button)
 
-
-        # ── 로봇 안전 모드 패널 ───────────────────────────────────────────
-        safety_group = QGroupBox('로봇 안전 모드')
-        safety_layout = QVBoxLayout(safety_group)
-
-        # 하드웨어 상태 / 속도 모드 표시 행
-        hw_row = QHBoxLayout()
-        self.hw_state_label    = QLabel('HW: --')
-        self.speed_mode_label  = QLabel('속도: --')
-        self.hw_state_label.setStyleSheet(
-            'font-weight: bold; padding: 4px 8px; border-radius: 4px;'
-            'background-color: #2a2a2a;'
-        )
-        self.speed_mode_label.setStyleSheet(
-            'font-weight: bold; padding: 4px 8px; border-radius: 4px;'
-            'background-color: #2a2a2a;'
-        )
-        hw_row.addWidget(self.hw_state_label)
-        hw_row.addStretch(1)
-        hw_row.addWidget(self.speed_mode_label)
-        safety_layout.addLayout(hw_row)
-
-        # 속도 모드 전환 행
-        speed_row = QHBoxLayout()
-        self.speed_normal_button = QPushButton('🟢 정상 속도')
-        self.speed_normal_button.setMinimumHeight(34)
-        self.speed_normal_button.setStyleSheet(
-            'QPushButton { background-color: #1a5c1a; color: white;'
-            '  font-weight: bold; border-radius: 5px; }'
-            'QPushButton:hover { background-color: #22881a; }'
-            'QPushButton:disabled { background-color: #444; color: #888; }'
-        )
-        self.speed_normal_button.clicked.connect(self._speed_normal)
-
-        self.speed_reduced_button = QPushButton('🟡 감속 모드')
-        self.speed_reduced_button.setMinimumHeight(34)
-        self.speed_reduced_button.setStyleSheet(
-            'QPushButton { background-color: #7a6000; color: white;'
-            '  font-weight: bold; border-radius: 5px; }'
-            'QPushButton:hover { background-color: #aa8800; }'
-            'QPushButton:disabled { background-color: #444; color: #888; }'
-        )
-        self.speed_reduced_button.clicked.connect(self._speed_reduced)
-
-        speed_row.addWidget(self.speed_normal_button)
-        speed_row.addWidget(self.speed_reduced_button)
-        safety_layout.addLayout(speed_row)
-
-        # 서보 OFF / ON 행
-        servo_row = QHBoxLayout()
-        self.servo_off_button = QPushButton('⚡ 서보 OFF')
-        self.servo_off_button.setMinimumHeight(34)
-        self.servo_off_button.setStyleSheet(
-            'QPushButton { background-color: #5a0050; color: white;'
-            '  font-weight: bold; border-radius: 5px; }'
-            'QPushButton:hover { background-color: #880077; }'
-            'QPushButton:disabled { background-color: #444; color: #888; }'
-        )
-        self.servo_off_button.clicked.connect(self._servo_off)
-
-        self.servo_on_button = QPushButton('🟢 서보 ON')
-        self.servo_on_button.setMinimumHeight(34)
-        self.servo_on_button.setEnabled(False)
-        self.servo_on_button.setStyleSheet(
-            'QPushButton { background-color: #006600; color: white;'
-            '  font-weight: bold; border-radius: 5px; }'
-            'QPushButton:hover { background-color: #009900; }'
-            'QPushButton:disabled { background-color: #444; color: #888; }'
-        )
-        self.servo_on_button.clicked.connect(self._servo_on)
-
-        servo_row.addWidget(self.servo_off_button)
-        servo_row.addWidget(self.servo_on_button)
-        safety_layout.addLayout(servo_row)
-
-        # ── Doosan 내장 안전 모드 패널 ──────────────────────────────────
-        dsr_safety_group = QGroupBox('Doosan 안전 모드')
-        dsr_safety_layout = QVBoxLayout(dsr_safety_group)
-
-        self.safety_mode_label = QLabel('현재 안전 모드: 알 수 없음')
-        self.safety_mode_label.setStyleSheet(
-            'font-weight: bold; padding: 3px 6px; border-radius: 4px;'
-            'background-color: #2a2a2a; color: white;'
-        )
-        dsr_safety_layout.addWidget(self.safety_mode_label)
-
-        safety_mode_row = QHBoxLayout()
-
-        self.safety_auto_button = QPushButton('🤖  정상 운전')
-        self.safety_auto_button.setMinimumHeight(40)
-        self.safety_auto_button.setToolTip('AUTONOMOUS — 정상 Pick & Place 자율 운전')
-        self.safety_auto_button.setStyleSheet(
-            'QPushButton { background-color: #003a70; color: white;'
-            '  font-size: 13px; font-weight: bold; border-radius: 6px; }'
-            'QPushButton:hover { background-color: #0055a0; }'
-            'QPushButton:disabled { background-color: #444; color: #888; }'
-        )
-        self.safety_auto_button.clicked.connect(self._safety_normal)
-
-        self.safety_backdrive_button = QPushButton('✋  역구동')
-        self.safety_backdrive_button.setMinimumHeight(40)
-        self.safety_backdrive_button.setToolTip('BACKDRIVE — 외력으로 로봇 수동 이동 가능')
-        self.safety_backdrive_button.setStyleSheet(
-            'QPushButton { background-color: #2a2a5a; color: white;'
-            '  font-size: 13px; font-weight: bold; border-radius: 6px; }'
-            'QPushButton:hover { background-color: #3a3a80; }'
-            'QPushButton:disabled { background-color: #444; color: #888; }'
-        )
-        self.safety_backdrive_button.clicked.connect(self._safety_backdrive)
-
-        safety_mode_row.addWidget(self.safety_auto_button)
-        safety_mode_row.addWidget(self.safety_backdrive_button)
-        dsr_safety_layout.addLayout(safety_mode_row)
-
         object_group = QGroupBox('검출된 물체 선택')
         object_layout = QVBoxLayout(object_group)
         self.auto_button = QPushButton('자동 선택 사용')
@@ -792,12 +605,8 @@ class PickPlaceGui(QWidget):
         self.object_summary.setWordWrap(True)
         object_layout.addWidget(self.object_summary)
 
-        right_panel.addWidget(emergency_group)
         right_panel.addWidget(status_group)
         right_panel.addWidget(control_group)
-        right_panel.addWidget(safety_group)
-        right_panel.addWidget(dsr_safety_group)
-
         right_panel.addWidget(object_group)
         right_panel.addStretch(1)
 
@@ -822,41 +631,6 @@ class PickPlaceGui(QWidget):
     def _gripper_close(self):
         self.ros_node.call_trigger_service(self.ros_node.cli_gripper_close, 'gripper/close')
 
-
-    def _e_stop(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_e_stop, 'pick_place/e_stop')
-
-    def _cancel_task(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_cancel, 'pick_place/cancel')
-
-    def _e_stop_reset(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_e_stop_reset, 'pick_place/e_stop_reset')
-
-    def _speed_normal(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_speed_normal, 'pick_place/speed_normal')
-
-    def _speed_reduced(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_speed_reduced, 'pick_place/speed_reduced')
-
-    def _servo_off(self):
-        from PyQt5.QtWidgets import QMessageBox
-        reply = QMessageBox.warning(
-            self, '서보 OFF 확인',
-            '모든 관절 모터 전원을 차단합니다.\n로봇이 중력에 의해 움직일 수 있습니다.\n\n계속하시겠습니까?',
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if reply == QMessageBox.Yes:
-            self.ros_node.call_trigger_service(self.ros_node.cli_servo_off, 'pick_place/servo_off')
-
-    def _servo_on(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_servo_on, 'pick_place/servo_on')
-
-    def _safety_normal(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_safety_normal, 'pick_place/safety_normal')
-
-    def _safety_backdrive(self):
-        self.ros_node.call_trigger_service(self.ros_node.cli_safety_backdrive, 'pick_place/safety_backdrive')
-
     def _update_ui(self):
         # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
         if self.ros_node.latest_qimage is not None:
@@ -872,90 +646,11 @@ class PickPlaceGui(QWidget):
         self.state_label.setText(f'Pick & Place 상태: {self.ros_node.pick_place_state}')
         self.selection_label.setText(f'선택 물체: {selected_text}')
         self.selection_status_label.setText(self._build_selection_status())
-
-        state        = self.ros_node.pick_place_state
-        is_e_stopped = state == 'EMERGENCY_STOP'
-        is_idle      = state == 'IDLE'
-        is_active    = state not in ('IDLE', 'EMERGENCY_STOP')
-
-        # ── 긴급 제어 버튼 ────────────────────────────────────────────
-        self.e_stop_button.setEnabled(not is_e_stopped)
-        self.cancel_button.setEnabled(is_active)
-        self.e_stop_reset_button.setEnabled(is_e_stopped)
-
-        # ── 수동 제어 버튼 ────────────────────────────────────────────
-        manual_enabled = state in ('IDLE', 'DETECTING', 'ERROR')
+        manual_enabled = self.ros_node.pick_place_state in ('IDLE', 'DETECTING', 'ERROR')
         self.home_button.setEnabled(manual_enabled)
         self.gripper_open_button.setEnabled(manual_enabled)
         self.gripper_close_button.setEnabled(manual_enabled)
-        self.auto_button.setEnabled(is_idle)
-
-        # ── 안전 모드 버튼 ────────────────────────────────────────────
-        # 속도 모드: EMERGENCY_STOP이 아닐 때 전환 가능
-        self.speed_normal_button.setEnabled(not is_e_stopped)
-        self.speed_reduced_button.setEnabled(not is_e_stopped)
-        # 서보 OFF: EMERGENCY_STOP 아닐 때 / 서보 ON: HW 상태가 SAFE_OFF(3,10)일 때
-        hw = self.ros_node.hw_state
-        is_safe_off = hw in (3, 10)   # STATE_SAFE_OFF, STATE_SAFE_OFF2
-        self.servo_off_button.setEnabled(not is_e_stopped)
-        self.servo_on_button.setEnabled(is_safe_off or is_e_stopped)
-
-        # ── HW 상태 레이블 ────────────────────────────────────────────
-        hw_state_names = {
-            0: 'INITIALIZING', 1: 'STANDBY', 2: 'MOVING',
-            3: 'SAFE_OFF', 4: 'TEACHING', 5: 'SAFE_STOP',
-            6: 'E-STOP', 7: 'HOMING', 8: 'RECOVERY',
-            9: 'SAFE_STOP2', 10: 'SAFE_OFF2', 15: 'NOT_READY',
-        }
-        hw_name = hw_state_names.get(self.ros_node.hw_state, f'CODE={self.ros_node.hw_state}')
-        hw_color = {
-            1: '#1a6a1a',   # STANDBY   → 녹색
-            2: '#1a4a8a',   # MOVING    → 파랑
-            5: '#8a4a00',   # SAFE_STOP → 주황
-            6: '#8a0000',   # E-STOP    → 빨강
-            3: '#8a0000',   # SAFE_OFF  → 빨강
-        }.get(self.ros_node.hw_state, '#444444')
-        self.hw_state_label.setText(f'HW: {hw_name}')
-        self.hw_state_label.setStyleSheet(
-            f'font-weight: bold; padding: 4px 8px; border-radius: 4px;'
-            f'background-color: {hw_color}; color: white;'
-        )
-
-        speed_name = '감속 모드' if self.ros_node.speed_mode == 1 else '정상 속도'
-        speed_color = '#7a6000' if self.ros_node.speed_mode == 1 else '#1a5c1a'
-        self.speed_mode_label.setText(f'속도: {speed_name}')
-        self.speed_mode_label.setStyleSheet(
-            f'font-weight: bold; padding: 4px 8px; border-radius: 4px;'
-            f'background-color: {speed_color}; color: white;'
-        )
-
-        # ── Doosan 안전 모드 버튼 — 항상 활성 (역구동/비상정지 해제 수단이므로) ──
-        is_backdrive = state == 'BACKDRIVE'
-        self.safety_auto_button.setEnabled(True)
-        self.safety_backdrive_button.setEnabled(not is_backdrive)
-
-        # 역구동 중 라벨 업데이트
-        if is_backdrive:
-            self.safety_mode_label.setText('현재 안전 모드: 역구동 (중력보상 스트리밍 중)')
-            self.safety_mode_label.setStyleSheet(
-                'font-weight: bold; padding: 3px 6px; border-radius: 4px;'
-                'background-color: #2a2a5a; color: #aaaaff;'
-            )
-        else:
-            self.safety_mode_label.setText('현재 안전 모드: 정상 운전')
-            self.safety_mode_label.setStyleSheet(
-                'font-weight: bold; padding: 3px 6px; border-radius: 4px;'
-                'background-color: #2a2a2a; color: white;'
-            )
-
-        # ── 배경색 경고 ───────────────────────────────────────────────
-        if is_backdrive:
-            self.setStyleSheet('QWidget { background-color: #0a0a2a; }')
-        elif is_e_stopped:
-            self.setStyleSheet('QWidget { background-color: #3a0000; }')
-        else:
-            self.setStyleSheet('')
-
+        self.auto_button.setEnabled(self.ros_node.pick_place_state == 'IDLE')
 
         # 같은 라벨의 물체가 여러 개 검출될 수 있으므로 버튼은 라벨 단위로만 만든다.
         labels = []

@@ -9,6 +9,18 @@ setup(
     name=package_name,
     version='0.1.0',
     packages=find_packages(exclude=['test']),
+    # find_packages()는 dsr_realsense_pick_place 디렉터리만 패키지로 찾는다.
+    # 패키지 바깥의 .py 파일들(pca_mask_utils 등)은 py_modules로 직접 지정해야
+    # colcon build 시 install 디렉터리에 함께 설치되어 import 할 수 있다.
+    py_modules=[
+        'pca_mask_utils',
+        'vision_display_utils',
+        'yolo_check',
+        'yolo_live_cam',
+        'yolo_live_cam_3d_metrics',
+        'prepare_yolo_dataset',
+        'train_yolo',
+    ],
     data_files=[
         # ament 인덱스와 share 디렉터리에 패키지 메타데이터를 설치한다.
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
