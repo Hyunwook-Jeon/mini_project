@@ -32,6 +32,10 @@ ARGUMENTS = [
                           description='Doosan 모델명'),
     DeclareLaunchArgument('color', default_value='white',
                           description='로봇 색상'),
+    DeclareLaunchArgument('robot_name', default_value='dsr01',
+                          description='Doosan ROS namespace/name'),
+    DeclareLaunchArgument('robot_base_frame', default_value='base_link',
+                          description='로봇 기준 base frame'),
     DeclareLaunchArgument('use_realsense', default_value='true',
                           description='RealSense 카메라 노드 실행 여부'),
     DeclareLaunchArgument('camera_serial', default_value='',
@@ -64,7 +68,7 @@ def generate_launch_description():
             'port':  LaunchConfiguration('port'),
             'model': LaunchConfiguration('model'),
             'color': LaunchConfiguration('color'),
-            'name':  'dsr01',
+            'name':  LaunchConfiguration('robot_name'),
         }.items(),
     )
 
@@ -74,7 +78,7 @@ def generate_launch_description():
             ExecuteProcess(
                 cmd=[
                     'ros2', 'service', 'call',
-                    '/dsr01/system/set_robot_mode',
+                    ["/", LaunchConfiguration('robot_name'), '/system/set_robot_mode'],
                     'dsr_msgs2/srv/SetRobotMode',
                     '{robot_mode: 1}',
                 ],
@@ -108,7 +112,7 @@ def generate_launch_description():
             LaunchConfiguration('cam_tf_qy'),
             LaunchConfiguration('cam_tf_qz'),
             LaunchConfiguration('cam_tf_qw'),
-            'base_link',
+            LaunchConfiguration('robot_base_frame'),
             'camera_color_optical_frame',
         ],
         output='screen',
@@ -119,7 +123,9 @@ def generate_launch_description():
         executable='object_detector',
         name='object_detector',
         output='screen',
-        parameters=[params_file, {'use_realsense': LaunchConfiguration('use_realsense')}],
+        parameters=[params_file, {
+            'robot_base_frame': LaunchConfiguration('robot_base_frame'),
+        }],
     )
 
     gui_node = TimerAction(
@@ -144,7 +150,9 @@ def generate_launch_description():
                 executable='gripper_node',
                 name='rh_p12_rna_gripper',
                 output='screen',
-                parameters=[params_file, {'robot_ns': 'dsr01'}],
+                parameters=[params_file, {
+                    'robot_ns': LaunchConfiguration('robot_name'),
+                }],
             )
         ]
     )
@@ -157,7 +165,10 @@ def generate_launch_description():
                 executable='pick_place_node',
                 name='pick_place_node',
                 output='screen',
-                parameters=[params_file],
+                parameters=[params_file, {
+                    'robot_namespace': LaunchConfiguration('robot_name'),
+                    'robot_base_frame': LaunchConfiguration('robot_base_frame'),
+                }],
             )
         ]
     )

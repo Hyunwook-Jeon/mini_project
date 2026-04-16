@@ -40,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
-
+from rclpy.qos import qos_profile_sensor_data
 try:
     from cv_bridge import CvBridge
     _CV_BRIDGE_IMPORT_ERROR = None
@@ -153,7 +153,7 @@ class PickPlaceGuiNode(Node):
                     f'cv_bridge import 실패: {_CV_BRIDGE_IMPORT_ERROR}. '
                     'use_local_yolo=true 로 실행하거나 ROS python 환경을 정리하세요.'
                 )
-            self.create_subscription(Image, '/detection_debug_image', self._cb_image, 10)
+            self.create_subscription(Image, '/detection_debug_image', self._cb_image, qos_profile_sensor_data)
             self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
         self.create_subscription(String, '/pick_place_state', self._cb_state, 10)
 
@@ -1015,11 +1015,11 @@ class PickPlaceGui(QWidget):
             yaw = pose.get('yaw_deg', None)
             yaw_text = f'{yaw:+.1f}deg' if isinstance(yaw, (int, float)) else 'N/A'
             lines.append(
-                f"- {item.get('label', 'unknown')} | "
-                f"conf={item.get('confidence', 0.0):.2f} | "
-                f"x={pose.get('x', 0.0):.3f}, y={pose.get('y', 0.0):.3f}, z={pose.get('z', 0.0):.3f}, yaw={yaw_text}"
+                f"[{item.get('label', 'unknown')}] conf={item.get('confidence', 0.0):.2f}\n"
+                f"  XYZ=({pose.get('x', 0.0):+.3f}, {pose.get('y', 0.0):+.3f}, {pose.get('z', 0.0):+.3f}) m\n"
+                f"  Yaw={yaw_text}"
             )
-        self.object_summary.setText('\n'.join(lines))
+        self.object_summary.setText('\n\n'.join(lines))
 
     def _draw_object_frames_on_pixmap(self, pixmap: QPixmap):
         """검출 물체의 픽셀 중심에 간단한 좌표계(X/Z) 오버레이를 그린다."""
@@ -1029,11 +1029,11 @@ class PickPlaceGui(QWidget):
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
 
-            x_pen = QPen(QColor(255, 80, 80), 2)     # X축: 빨강
-            z_pen = QPen(QColor(80, 220, 255), 2)    # Z축(테이블 법선): 하늘색
-            center_pen = QPen(QColor(255, 255, 0), 2)
+            x_pen = QPen(QColor(255, 90, 90), 3)      # X축: 빨강
+            z_pen = QPen(QColor(80, 220, 255), 3)     # Z축(테이블 법선): 하늘색
+            center_pen = QPen(QColor(255, 255, 0), 3)
             text_pen = QPen(QColor(255, 255, 255), 1)
-            axis_len = 34
+            axis_len = 42
 
             for item in self.ros_node.detected_objects:
                 u = int(item.get('pixel_u', -1))
@@ -1053,16 +1053,24 @@ class PickPlaceGui(QWidget):
                     dy = -axis_len * math.sin(yaw_rad)
                     painter.setPen(x_pen)
                     painter.drawLine(u, v, int(round(u + dx)), int(round(v + dy)))
-                    painter.drawText(int(round(u + dx + 4)), int(round(v + dy - 4)), 'X')
+                    painter.drawText(int(round(u + dx + 6)), int(round(v + dy - 6)), 'LONG')
 
                 painter.setPen(z_pen)
                 painter.drawLine(u, v, u, v - axis_len)
                 painter.drawText(u + 4, v - axis_len - 4, 'Z')
 
-                painter.setPen(text_pen)
                 label = item.get('label', 'obj')
                 yaw_text = f'{float(yaw_deg):+.1f}deg' if isinstance(yaw_deg, (int, float)) else 'yaw=N/A'
-                painter.drawText(u + 8, v + 16, f'{label} {yaw_text}')
+                tag_text = f'{label} | {yaw_text}'
+                tag_x = u + 10
+                tag_y = v + 10
+                tag_w = max(118, 8 * len(tag_text))
+                tag_h = 24
+                painter.fillRect(tag_x, tag_y, tag_w, tag_h, QColor(20, 20, 20, 180))
+                painter.setPen(QPen(QColor(255, 190, 60), 1))
+                painter.drawRect(tag_x, tag_y, tag_w, tag_h)
+                painter.setPen(text_pen)
+                painter.drawText(tag_x + 8, tag_y + 16, tag_text)
         finally:
             painter.end()
 

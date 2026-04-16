@@ -24,6 +24,7 @@ Doosan 서비스 클라이언트 (namespace: /dsr01/):
 
 import threading
 import time
+import math
 from enum import Enum, auto
 
 import rclpy
@@ -134,8 +135,11 @@ class PickPlaceNode(Node):
         self.declare_parameter('workspace_y_max',             0.60)
         self.declare_parameter('workspace_z_min',             0.0)
         self.declare_parameter('workspace_z_max',             0.60)
+        self.declare_parameter('robot_base_frame',            'base_link')
         self.declare_parameter('target_pose_topic',           '/selected_object_pose')
         self.declare_parameter('selected_object_topic',       '/selected_object_label')
+        self.declare_parameter('use_target_pose_yaw',         True)
+        self.declare_parameter('grasp_yaw_offset_deg',        0.0)
 
         ns = self.get_parameter('robot_namespace').value
         self.jvel         = self.get_parameter('joint_vel').value
@@ -162,6 +166,9 @@ class PickPlaceNode(Node):
         self.place_pos    = self.get_parameter('place_position').value
         self.pre_place_dz = self.get_parameter('pre_place_z_offset').value
         self.place_rpy    = self.get_parameter('place_rpy').value
+        self.robot_base_frame = self.get_parameter('robot_base_frame').value
+        self.use_target_pose_yaw = self.get_parameter('use_target_pose_yaw').value
+        self.grasp_yaw_offset_deg = self.get_parameter('grasp_yaw_offset_deg').value
         self.ws = {
             'x': (self.get_parameter('workspace_x_min').value,
                   self.get_parameter('workspace_x_max').value),
@@ -305,6 +312,13 @@ class PickPlaceNode(Node):
         with self.state_lock:
             # DETECTING 상태일 때만 새 타겟을 수신해 다음 단계로 넘어간다
             if self.state == State.DETECTING and self.pick_requested:
+                frame_id = msg.header.frame_id.strip()
+                if frame_id and frame_id != self.robot_base_frame:
+                    self.get_logger().warn(
+                        f'프레임 불일치 무시: expected={self.robot_base_frame}, '
+                        f'got={frame_id}'
+                    )
+                    return
                 pos = msg.pose.position
                 if self._in_workspace(pos.x, pos.y, pos.z):
                     self.target_pose = msg
@@ -363,7 +377,7 @@ class PickPlaceNode(Node):
                         pose.pose.position.x,
                         pose.pose.position.y,
                         pose.pose.position.z + self.pre_pick_dz,
-                        self.grasp_rpy)
+                        self._grasp_rpy_for_pose(pose))
                     self._set_state(State.PICK)
 
                 elif current == State.PICK:
@@ -374,7 +388,7 @@ class PickPlaceNode(Node):
                         pose.pose.position.x,
                         pose.pose.position.y,
                         pose.pose.position.z + self.pick_dz,
-                        self.grasp_rpy, vel=50.0, acc=100.0)
+                        self._grasp_rpy_for_pose(pose), vel=50.0, acc=100.0)
                     self._gripper_close()
                     self._set_state(State.LIFT)
 
@@ -386,7 +400,7 @@ class PickPlaceNode(Node):
                         pose.pose.position.x,
                         pose.pose.position.y,
                         pose.pose.position.z + self.pre_pick_dz,
-                        self.grasp_rpy)
+                        self._grasp_rpy_for_pose(pose))
                     self._set_state(State.MOVE_TO_PLACE)
 
                 elif current == State.MOVE_TO_PLACE:
@@ -910,6 +924,36 @@ class PickPlaceNode(Node):
         req.sync_type  = 0        # ← Doosan 공식 camelCase (동기 블로킹)
         self._call_service(self.cli_movel, req,
                            f'move_line({x:.3f},{y:.3f},{z:.3f})', timeout=30.0)
+
+    def _grasp_rpy_for_pose(self, pose: PoseStamped):
+        rpy = [float(v) for v in self.grasp_rpy]
+        if not self.use_target_pose_yaw:
+            return rpy
+
+        yaw_deg = self._yaw_deg_from_pose(pose)
+        if yaw_deg is None:
+            return rpy
+
+        rpy[2] = self._wrap_deg(rpy[2] + yaw_deg + float(self.grasp_yaw_offset_deg))
+        self.get_logger().info(
+            f'그리퍼 yaw 적용: target={yaw_deg:+.1f} deg, cmd_rz={rpy[2]:+.1f} deg'
+        )
+        return rpy
+
+    def _yaw_deg_from_pose(self, pose: PoseStamped) -> float | None:
+        qx = float(pose.pose.orientation.x)
+        qy = float(pose.pose.orientation.y)
+        qz = float(pose.pose.orientation.z)
+        qw = float(pose.pose.orientation.w)
+        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if norm < 1e-6:
+            return None
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+        return math.degrees(math.atan2(siny_cosp, cosy_cosp))
+
+    def _wrap_deg(self, angle_deg: float) -> float:
+        return ((float(angle_deg) + 180.0) % 360.0) - 180.0
 
     def _call_service(self, cli, req, name: str, timeout: float = 15.0):
         """ROS 2 서비스를 call_async() + 폴링 방식으로 호출.
