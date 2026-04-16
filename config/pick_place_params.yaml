@@ -93,3 +93,21 @@ pick_place_node:
     workspace_z_min: 0.0
     workspace_z_max: 0.60
     target_pose_topic: "/selected_object_pose"
+
+# --- GUI (ros2 run gui_node / launch 시 pick_place_gui) ---
+# weights_path: 패키지 루트 기준 상대경로 (학습 산출 best.pt)
+# use_local_yolo: true 기본 — best.pt 로컬 YOLO + use_realsense 시 pyrealsense2.
+# pick_place.launch 는 gui 에만 use_local_yolo:false 를 덮어써 realsense2_camera 와 USB 충돌 방지.
+pick_place_gui:
+  ros__parameters:
+    weights_path: "runs/weights/weights/best.pt"
+    require_best_pt: true
+    # ROS 모드일 때 object_detector 토픽 (SensorData QoS 로 맞춤)
+    debug_image_topic: "/detection_debug_image"
+    detected_objects_topic: "/detected_objects"
+    use_local_yolo: true
+    use_realsense: true
+    rs_serial: ""
+    rs_width: 640
+    rs_height: 480
+    rs_fps: 30

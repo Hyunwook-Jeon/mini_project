@@ -143,12 +143,16 @@ def generate_launch_description():
         parameters=[params_file],
     )
 
+    # GUI만 ROS 디버그 영상(yaml 기본은 로컬 best.pt — 여기서 false 로 덮어씀).
     gui_node = Node(
         package='dsr_realsense_pick_place',
         executable='gui_node',
         name='pick_place_gui',
         output='screen',
-        parameters=[params_file],
+        parameters=[
+            params_file,
+            {'use_local_yolo': False},
+        ],
         condition=IfCondition(LaunchConfiguration('gui')),
     )
 
