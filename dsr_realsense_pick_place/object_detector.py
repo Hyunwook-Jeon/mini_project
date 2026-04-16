@@ -25,6 +25,7 @@ RealSense RGB-D + YOLOv8 기반 객체 검출 노드.
 """
 
 import json
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -161,14 +162,67 @@ class ObjectDetectorNode(Node):
         self.get_logger().info('컬러/뎁스/카메라정보 토픽 동기화 대기 중...')
         self.get_logger().info('ObjectDetectorNode 시작')
 
+    def _repo_root(self) -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    def _candidate_search_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[Path] = set()
+
+        def _add(path: Path):
+            resolved = path.resolve()
+            if resolved not in seen and resolved.exists():
+                seen.add(resolved)
+                roots.append(resolved)
+
+        _add(self._repo_root())
+        _add(Path.cwd())
+        _add(Path.cwd() / 'mini_project')
+
+        for parent in Path(__file__).resolve().parents:
+            _add(parent)
+            _add(parent / 'src')
+            _add(parent / 'src' / 'mini_project')
+
+        return roots
+
+    def _resolve_model_name(self, model_name: str) -> str:
+        model_path = Path(model_name).expanduser()
+        if (
+            not model_name or
+            not model_path.suffix or
+            model_path.is_absolute() or
+            ('/' not in model_name and '\\' not in model_name)
+        ):
+            return model_name
+
+        candidates = [root / model_path for root in self._candidate_search_roots()]
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate.resolve())
+
+        matches: list[Path] = []
+        for root in self._candidate_search_roots():
+            matches.extend(p for p in root.rglob(model_path.name) if p.is_file())
+
+        if matches:
+            if len(matches) > 1:
+                suffix = model_path.as_posix()
+                for match in matches:
+                    if match.as_posix().endswith(suffix):
+                        return str(match.resolve())
+            return str(matches[0].resolve())
+
+        return str((self._repo_root() / model_path).resolve())
+
     # ────────────────────────────────────────────────────────────────────
     # YOLO 로드
     # ────────────────────────────────────────────────────────────────────
     def _load_yolo(self):
-        model_name = self.get_parameter('yolo_model').value
-        
-        import os
-        model_name = os.path.expandvars(os.path.expanduser(model_name))
+
+        model_name = str(self.get_parameter('yolo_model').value).strip()
+        model_name = self._resolve_model_name(model_name)
+
         try:
             from ultralytics import YOLO
             # model_name 이 파일 경로면 로컬 파일을, 문자열이면 기본 weight 이름을 읽는다.
@@ -558,8 +612,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
