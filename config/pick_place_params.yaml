@@ -30,16 +30,18 @@ object_detector:
     depth_center_ratio: 0.6         # 샘플링 반경 내 사용 비율 (0~1)
     depth_outlier_mad_scale: 2.5    # MAD 이상치 제거 스케일 팩터
     selected_object_topic: "/selected_object_label"
-
-
-        # ★ 아래 내용 추가 ★
+    use_object_yaw_for_grasp: True
+    yaw_axis_reference: "long"
+    yaw_depth_band_m: 0.03
+    yaw_min_mask_pixels: 40
     # --- 좌표 변환 모드 ---
     # true: 수동 원점 오프셋 방식 (TF 없이 동작, 캘리브레이션 필요)
     # false: TF2 방식 (static TF가 정확히 설정된 경우 사용)
     use_manual_absolute_origin: True   # 일단 TF 방식으로 시작
 
     # --- 수동 절대좌표 원점 (use_manual_absolute_origin: true 일 때 사용) ---
-    # 카메라 좌표계 기준 로봇 base_link 원점의 위치 (m)
+    # yolo_live_cam_3d_metrics와 동일한 project camera 좌표계 기준
+    # 로봇 base_link 원점의 위치 (m)
     # 실측 후 채워넣기
     absolute_origin_in_camera_x_m: -0.80
     absolute_origin_in_camera_y_m: 0.0
@@ -69,6 +71,9 @@ pick_place_node:
   ros__parameters:
     # --- 로봇 설정 ---
     robot_namespace: "dsr01"
+    robot_base_frame: "base_link"
+    use_target_pose_yaw: True
+    grasp_yaw_offset_deg: 0.0
 
     # --- 속도/가속도 ---
     joint_vel: 30.0                 # deg/s

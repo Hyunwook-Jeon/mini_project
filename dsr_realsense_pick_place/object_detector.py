@@ -25,6 +25,7 @@ RealSense RGB-D + YOLOv8 기반 객체 검출 노드.
 """
 
 import json
+import math
 from pathlib import Path
 
 import rclpy
@@ -80,6 +81,10 @@ class ObjectDetectorNode(Node):
         # 값이 작을수록 이상치 기준이 엄격해져 더 많은 샘플이 제거된다.
         self.declare_parameter('depth_outlier_mad_scale', 2.5)
         self.declare_parameter('selected_object_topic', '/selected_object_label')
+        self.declare_parameter('use_object_yaw_for_grasp', True)
+        self.declare_parameter('yaw_axis_reference', 'long')
+        self.declare_parameter('yaw_depth_band_m', 0.03)
+        self.declare_parameter('yaw_min_mask_pixels', 40)
         # absolute_origin_in_camera_*:
         # 절대좌표계 원점이 카메라 좌표계에서 어디에 있는지(m) 지정.
         # 예) 원점이 카메라 기준 (-0.80, 0.0, -0.96)이면
@@ -118,6 +123,10 @@ class ObjectDetectorNode(Node):
         self.abs_calib_y_m = float(p('absolute_calib_y_mm').value) / 1000.0
         self.abs_calib_z_m = float(p('absolute_calib_z_mm').value) / 1000.0
         self.use_manual_absolute_origin = p('use_manual_absolute_origin').value
+        self.use_object_yaw_for_grasp = p('use_object_yaw_for_grasp').value
+        self.yaw_axis_reference = str(p('yaw_axis_reference').value).strip().lower()
+        self.yaw_depth_band_m = float(p('yaw_depth_band_m').value)
+        self.yaw_min_mask_pixels = int(p('yaw_min_mask_pixels').value)
         self.selected_object_label = ''
         self.last_logged_selected_label = None
 
@@ -337,11 +346,19 @@ class ObjectDetectorNode(Node):
                         (u - w // 2, v - h // 2 - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            # RealSense 픽셀 좌표를 카메라 3D 좌표로 바꾼 뒤 절대좌표로 변환한다.
-            pose_cam = self._pixel_to_camera_pose(u, v, depth_m)
-            pose_abs = self._to_absolute_pose(pose_cam)
+            # 픽셀 좌표를 RealSense optical frame 3D 좌표로 바꾼다.
+            # 수동 절대좌표 모드에서는 이후 yolo_live_cam_3d_metrics와 같은
+            # 프로젝트 좌표계로 다시 변환한다.
+            pose_optical = self._pixel_to_optical_pose(u, v, depth_m)
+            pose_abs = self._to_absolute_pose(pose_optical)
             if pose_abs is None:
                 continue
+
+            yaw_deg = None
+            if self.use_object_yaw_for_grasp:
+                yaw_deg = self._estimate_object_yaw_deg(depth_img, u, v, w, h, depth_m)
+                if yaw_deg is not None and self.use_manual_absolute_origin:
+                    self._set_pose_yaw_deg(pose_abs, yaw_deg)
 
             pos = pose_abs.pose.position
             candidates.append({
@@ -355,8 +372,15 @@ class ObjectDetectorNode(Node):
                     'x': pos.x,
                     'y': pos.y,
                     'z': pos.z,
+                    'yaw_deg': yaw_deg,
                 },
             })
+
+            if yaw_deg is not None:
+                cv2.putText(debug_img,
+                            f'yaw {yaw_deg:+.1f} deg',
+                            (u - w // 2, v + h // 2 + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 2)
 
         self._publish_detected_objects(candidates)
 
@@ -375,7 +399,8 @@ class ObjectDetectorNode(Node):
         self.pub_selected_pose.publish(pose_abs)
         self.get_logger().info(
             f'[{selected["label"]}] 절대좌표: '
-            f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m'
+            f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m '
+            f'yaw={self._pose_yaw_deg(selected["pose"]):+.1f} deg'
         )
 
     def _estimate_depth_m(self, depth_img: np.ndarray, u: int, v: int):
@@ -440,19 +465,92 @@ class ObjectDetectorNode(Node):
         # 평균 대신 중앙값을 사용해 남은 이상치의 영향도 최소화한다.
         return float(np.median(samples))
 
+    def _estimate_object_yaw_deg(
+        self,
+        depth_img: np.ndarray,
+        u: int,
+        v: int,
+        box_w: int,
+        box_h: int,
+        depth_m: float,
+    ) -> float | None:
+        """깊이 밴드 마스크의 2D PCA로 물체의 평면 yaw를 추정한다.
+
+        yaw_axis_reference:
+          - long  -> PCA 긴축(major axis) 기준
+          - short -> PCA 단축(minor axis) 기준
+        """
+        if not math.isfinite(depth_m):
+            return None
+
+        h_img, w_img = depth_img.shape[:2]
+        x0 = max(0, u - box_w // 2)
+        x1 = min(w_img, u + box_w // 2 + 1)
+        y0 = max(0, v - box_h // 2)
+        y1 = min(h_img, v + box_h // 2 + 1)
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            return None
+
+        roi = depth_img[y0:y1, x0:x1].astype(np.float32) * self.depth_scale
+        valid = roi > 0.0
+        valid &= np.abs(roi - float(depth_m)) <= self.yaw_depth_band_m
+        if int(np.count_nonzero(valid)) < self.yaw_min_mask_pixels:
+            return None
+
+        mask = np.zeros((h_img, w_img), dtype=np.uint8)
+        mask[y0:y1, x0:x1] = valid.astype(np.uint8) * 255
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        ys, xs = np.nonzero(mask)
+        if ys.size < self.yaw_min_mask_pixels:
+            return None
+
+        pts = np.column_stack((xs.astype(np.float32), ys.astype(np.float32)))
+        mean, eigvecs = cv2.PCACompute(pts, mean=None, maxComponents=2)
+        if eigvecs is None or eigvecs.shape[0] == 0:
+            return None
+
+        axis_index = 1 if self.yaw_axis_reference == 'short' and eigvecs.shape[0] > 1 else 0
+        axis_u = float(eigvecs[axis_index][0])
+        axis_v = float(eigvecs[axis_index][1])
+
+        # 이미지 축(u right, v down) -> project camera XY(x left, y down)
+        proj_x = -axis_u
+        proj_y = axis_v
+        yaw_deg = math.degrees(math.atan2(proj_y, proj_x))
+        return self._normalize_grasp_yaw_deg(yaw_deg)
+
+    def _normalize_grasp_yaw_deg(self, yaw_deg: float) -> float:
+        """그리퍼 180도 대칭을 고려해 yaw를 [-90, 90) 범위로 접는다."""
+        wrapped = ((float(yaw_deg) + 180.0) % 360.0) - 180.0
+        if wrapped >= 90.0:
+            wrapped -= 180.0
+        if wrapped < -90.0:
+            wrapped += 180.0
+        return wrapped
+
+    def _set_pose_yaw_deg(self, pose: PoseStamped, yaw_deg: float):
+        yaw_rad = math.radians(float(yaw_deg))
+        pose.pose.orientation.x = 0.0
+        pose.pose.orientation.y = 0.0
+        pose.pose.orientation.z = math.sin(yaw_rad * 0.5)
+        pose.pose.orientation.w = math.cos(yaw_rad * 0.5)
+
+    def _pose_yaw_deg(self, pose: PoseStamped) -> float:
+        qz = float(pose.pose.orientation.z)
+        qw = float(pose.pose.orientation.w)
+        return math.degrees(2.0 * math.atan2(qz, qw))
+
     # ────────────────────────────────────────────────────────────────────
-    # 픽셀 + depth → 카메라 프레임 PoseStamped
+    # 픽셀 + depth → RealSense optical frame PoseStamped
     # ────────────────────────────────────────────────────────────────────
-    def _pixel_to_camera_pose(self, u: int, v: int, depth_m: float) -> PoseStamped:
-        """픽셀 좌표 (u, v)와 깊이 depth_m(m)을 카메라 3D 좌표로 변환한다.
+    def _pixel_to_optical_pose(self, u: int, v: int, depth_m: float) -> PoseStamped:
+        """픽셀 좌표 (u, v)와 깊이 depth_m(m)을 RealSense optical 3D 좌표로 변환한다.
 
         RealSense SDK의 rs2_deproject_pixel_to_point()는 핀홀 모델 + 왜곡 보정을 적용해
         픽셀 좌표를 카메라 광학 좌표계(camera_color_optical_frame)의 3D 점으로 변환한다.
-
-        이 프로젝트에서는 optical frame 축을 다음과 같이 재정의해 사용한다.
-          X: 왼쪽 (+)   [기본 optical X(오른쪽 +)의 반대]
-          Y: 아래쪽 (+) [기본 optical Y와 동일]
-          Z: 카메라 뒤쪽 (+) [기본 optical Z(앞쪽 +)의 반대]
         """
         # rs2_deproject_pixel_to_point: (intrinsics, [u, v], depth_m) → [X, Y, Z]
         # 내부적으로 수식: X = (u - ppx) / fx * Z, Y = (v - ppy) / fy * Z
@@ -461,8 +559,6 @@ class ObjectDetectorNode(Node):
             [float(u), float(v)],
             float(depth_m),
         )
-        X = -X
-        Z = -Z
 
         ps = PoseStamped()
         ps.header.frame_id = self.camera_frame   # 'camera_color_optical_frame'
@@ -472,6 +568,23 @@ class ObjectDetectorNode(Node):
         ps.pose.position.z = Z
         ps.pose.orientation.w = 1.0   # 방향은 단위 quaternion (회전 없음)
         return ps
+
+    def _optical_to_project_camera_pose(self, pose_optical: PoseStamped) -> PoseStamped:
+        """RealSense optical frame을 yolo_live_cam_3d_metrics 프로젝트 좌표계로 바꾼다.
+
+        변환 규칙은 yolo_live_cam_3d_metrics / gui_node와 동일하다.
+          X: 왼쪽 (+)   = -optical_x
+          Y: 아래쪽 (+) =  optical_y
+          Z: 카메라 뒤쪽 (+) = -optical_z
+        """
+        pose_project = PoseStamped()
+        pose_project.header = pose_optical.header
+        pose_project.header.frame_id = 'project_camera_frame'
+        pose_project.pose.position.x = -pose_optical.pose.position.x
+        pose_project.pose.position.y = pose_optical.pose.position.y
+        pose_project.pose.position.z = -pose_optical.pose.position.z
+        pose_project.pose.orientation = pose_optical.pose.orientation
+        return pose_project
 
     # ────────────────────────────────────────────────────────────────────
     # 카메라 프레임 → 로봇 베이스 프레임 변환
@@ -501,21 +614,26 @@ class ObjectDetectorNode(Node):
             self.get_logger().warn(f'TF 변환 실패: {e}')
             return None
 
-    def _to_absolute_pose(self, pose_cam: PoseStamped):
+    def _to_absolute_pose(self, pose_optical: PoseStamped):
         """카메라 좌표를 절대좌표로 변환한다.
 
         use_manual_absolute_origin=True:
+          yolo_live_cam_3d_metrics와 같은 프로젝트 카메라 좌표계로 먼저 바꾼 뒤
           절대원점의 카메라좌표(ox, oy, oz)를 사용해
-          p_abs = p_cam - o_cam
+          p_abs = p_project_cam - o_project_cam
         use_manual_absolute_origin=False:
-          기존 TF(camera -> robot_base_frame) 변환 사용
+          RealSense optical frame 기준 TF(camera -> robot_base_frame) 변환 사용
         """
         if not self.use_manual_absolute_origin:
-            return self._transform_to_base(pose_cam)
+            return self._transform_to_base(pose_optical)
+
+        pose_cam = self._optical_to_project_camera_pose(pose_optical)
 
         pose_abs = PoseStamped()
         pose_abs.header = pose_cam.header
-        pose_abs.header.frame_id = 'absolute_frame'
+        # 수동 원점 방식의 결과도 pick_place_node에서는 로봇 베이스 기준
+        # 절대좌표로 사용하므로 frame_id를 base frame과 일치시킨다.
+        pose_abs.header.frame_id = self.robot_base_frame
         pose_abs.pose.position.x = (
             pose_cam.pose.position.x - self.abs_origin_cam_x + self.abs_calib_x_m
         )
