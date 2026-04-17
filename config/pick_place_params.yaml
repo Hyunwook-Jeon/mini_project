@@ -15,7 +15,7 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "/home/hyunwook/ros2_ws/src/mini_project/runs/weights/weights/best.pt"
+    yolo_model: "/home/kelly/doosan_ws/src/mini_project/runs/weights/weights/best.pt"
     confidence_threshold: 0.5
 
 
@@ -49,9 +49,9 @@ object_detector:
     absolute_origin_in_camera_z_m: -0.96
 
     # --- 보정값 (mm) ---
-    absolute_calib_x_mm: -20.0
-    absolute_calib_y_mm: -20.0
-    absolute_calib_z_mm: 140.0
+    absolute_calib_x_mm: -80.0
+    absolute_calib_y_mm: 40.0
+    absolute_calib_z_mm: 125.0
     use_realsense: true # RealSense 카메라 사용 여부
 
     # --- PCA 기반 객체 방향/크기 추정 파라미터 ---
@@ -120,14 +120,14 @@ pick_place_node:
     # --- Pick 파라미터 ---
     pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)
     pick_z_offset: 0.015            # 실제 픽 높이 보정 (m)
-    grasp_rpy: [0.0, 180.0, 0.0]    # 그리퍼 자세 (rx, ry, rz deg)
+    grasp_rpy: [0.0, 179.9, 0.0]    # 그리퍼 자세 (rx, ry, rz deg)
                                     # [0, 180, 0] = 수직 하강
 
     # --- Place 파라미터 ---
     # Place 위치 (로봇 베이스 기준, m)
-    place_position: [0.4, -0.3, 0.1]
+    place_position: [0.4, -0.3, 0.2]
     pre_place_z_offset: 0.15        # Place 위 대기 높이 (m)
-    place_rpy: [0.0, 180.0, 0.0]
+    place_rpy: [0.0, 179.9, 0.0]
 
     # --- 안전 설정 ---
     workspace_x_min: 0.15           # 작업 영역 제한 (m)

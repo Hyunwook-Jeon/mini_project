@@ -383,7 +383,7 @@ class ObjectDetectorNode(Node):
                 'depth_m': depth_m,
                 'pixel_u': u,
                 'pixel_v': v,
-                'pose': pose_base,
+                'pose': pose_abs,
                 'pose_dict': {
                     'x': pos.x,
                     'y': pos.y,
@@ -533,8 +533,8 @@ class ObjectDetectorNode(Node):
         axis_v = float(eigvecs[axis_index][1])
 
         # 이미지 축(u right, v down) -> project camera XY(x left, y down)
-        proj_x = -axis_u
-        proj_y = axis_v
+        proj_x = axis_v
+        proj_y = -axis_u
         yaw_deg = math.degrees(math.atan2(proj_y, proj_x))
         return self._normalize_grasp_yaw_deg(yaw_deg)
 
