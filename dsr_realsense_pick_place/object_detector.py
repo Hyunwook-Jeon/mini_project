@@ -416,7 +416,8 @@ class ObjectDetectorNode(Node):
         self.get_logger().info(
             f'[{selected["label"]}] 절대좌표: '
             f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m '
-            f'yaw={self._pose_yaw_deg(selected["pose"]):+.1f} deg'
+            f'yaw={self._pose_yaw_deg(selected["pose"]):+.1f} deg',
+            throttle_duration_sec=1.0,
         )
 
     def _estimate_depth_m(self, depth_img: np.ndarray, u: int, v: int):

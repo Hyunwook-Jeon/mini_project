@@ -174,6 +174,7 @@ class GripperNode(Node):
         self._stroke = 0
         self._torque = False
         self._ready  = False
+        self._drl_lock = threading.Lock()
 
         # ── 초기화 타이머 (executor 기동 후 실행) ─────────────────
         self._init_timer = self.create_timer(
@@ -230,7 +231,8 @@ class GripperNode(Node):
                      motion_wait: float, label: str) -> bool:
         """패킷 리스트를 DRL 스크립트로 변환 후 실행합니다."""
         code = build_drl(packets, motion_wait)
-        return self._drl(code, label)
+        with self._drl_lock:
+            return self._drl(code, label)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 초기화 (one-shot 타이머 콜백)

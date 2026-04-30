@@ -49,6 +49,8 @@ ARGUMENTS = [
     DeclareLaunchArgument('cam_tf_qw', default_value='0.707'),
     DeclareLaunchArgument('gui', default_value='true',
                           description='PyQt GUI 실행 여부'),
+    DeclareLaunchArgument('use_launch_set_robot_mode', default_value='false',
+                          description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
 ]
 
 
@@ -84,7 +86,8 @@ def generate_launch_description():
                 ],
                 output='screen',
             )
-        ]
+        ],
+        condition=IfCondition(LaunchConfiguration('use_launch_set_robot_mode')),
     )
 
     realsense_node = IncludeLaunchDescription(

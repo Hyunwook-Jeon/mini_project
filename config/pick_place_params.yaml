@@ -15,7 +15,7 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "/home/kelly/doosan_ws/src/mini_project/runs/weights/weights/best.pt"
+    yolo_model: "runs/weights/weights/best.pt"
     confidence_threshold: 0.5
 
 
@@ -54,18 +54,24 @@ object_detector:
     absolute_calib_z_mm: 125.0
     use_realsense: true # RealSense 카메라 사용 여부
 
-    # --- PCA 기반 객체 방향/크기 추정 파라미터 ---
-    device: "cpu"
-    pca_z_band_m: 0.045
-    pca_ellipse_scale: 0.38
-    pca_step: 4
-    use_fastsam_for_pca: false
-    fastsam_weights: "" # 예: FastSAM-s.pt
-    use_seg_aux_for_pca: false
-    seg_aux_weights: "" # 예: yolov8n-seg.pt
-    seg_aux_imgsz: 640
-    seg_crop_pad: 0.15
-    no_depth_pca_fallback: false
+    # --- 비활성 PCA/Segmentation 참조 설정 ---
+    # NOTE:
+    #   현재 object_detector.py는 아래 파라미터를 선언하거나 사용하지 않습니다.
+    #   이 블록은 yolo_live_cam_3d_metrics.py / pca_mask_utils.py 기반 기능을
+    #   나중에 ROS 노드로 연결할 때 복구 참고용으로만 남겨둡니다.
+    #   주석 해제만으로는 PCA/Segmentation 동작이 활성화되지 않습니다.
+    #
+    # device: "cpu"
+    # pca_z_band_m: 0.045
+    # pca_ellipse_scale: 0.38
+    # pca_step: 4
+    # use_fastsam_for_pca: false
+    # fastsam_weights: "" # 예: FastSAM-s.pt
+    # use_seg_aux_for_pca: false
+    # seg_aux_weights: "" # 예: yolov8n-seg.pt
+    # seg_aux_imgsz: 640
+    # seg_crop_pad: 0.15
+    # no_depth_pca_fallback: false
 # ─── 기존 내용 아래에 추가 ───────────────────────────────────────────
 
 rh_p12_rna_gripper:
@@ -102,20 +108,6 @@ pick_place_node:
     # gripper_node의 motion_wait(1.5s)보다 길게 설정해야
     # 그리퍼 동작 완료 후 다음 로봇 모션이 시작됩니다.
     gripper_wait_sec: 1.7           # 그리퍼 동작 대기 시간 (s)
-
-    # --- ROBOTIS RH-P12-Rn 설정 ---
-    rh12_serial_service: "/dsr01/gripper/serial_send_data"
-    rh12_bridge_topic: "/gripper/rh12_stroke_cmd"
-    rh12_allow_missing_service: true
-    rh12_slave_id: 1
-    rh12_torque_enable_register: 256
-    rh12_goal_current_register: 275
-    rh12_stroke_register: 282
-    rh12_goal_current: 400
-    rh12_open_stroke: 700
-    rh12_close_stroke: 0
-    rh12_port: 1
-    rh12_init_wait_sec: 0.1
 
     # --- Pick 파라미터 ---
     pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)

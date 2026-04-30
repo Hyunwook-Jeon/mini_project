@@ -12,14 +12,12 @@ Doosan E0509 Pick & Place 상태머신 노드.
 
 발행:
   /pick_place_state        (std_msgs/String)
-  /gripper/rh12_stroke_cmd (std_msgs/Int32)
 
 Doosan 서비스 클라이언트 (namespace: /dsr01/):
   motion/move_joint        (dsr_msgs2/MoveJoint)
   motion/move_line         (dsr_msgs2/MoveLine)
-  gripper/serial_send_data (dsr_msgs2/SerialSendData)
 
-그리퍼: ROBOTIS RH-P12-Rn (Modbus RTU over serial)
+그리퍼: /gripper/open, /gripper/close 서비스 경유
 """
 
 import threading
@@ -34,7 +32,7 @@ from std_msgs.msg import Int32, String
 from std_srvs.srv import Trigger
 
 from dsr_msgs2.srv import (
-    MoveJoint, MoveLine, SerialSendData,
+    MoveJoint, MoveLine,
     MoveStop,
     ServoOff,
     GetRobotState, SetRobotSpeedMode, GetRobotSpeedMode,
@@ -70,33 +68,20 @@ HW_STATE_NAMES = {
 
 # ── 상태 정의 ───────────────────────────────────────────────────────────
 class State(Enum):
-    """Pick & Place 작업 단계를 나타내는 상태 열거형.
-
-    IDLE           : 초기 상태. 시작 시 홈으로 이동한 뒤 DETECTING으로 전환.
-    DETECTING      : /selected_object_pose 토픽에서 유효한 타겟 좌표를 기다리는 상태.
-    PRE_PICK       : 물체 위 pre_pick_z_offset 높이까지 이동. 그리퍼 미리 열기.
-    PICK           : 저속(50mm/s)으로 pick_z_offset 높이까지 하강 후 그리퍼 닫기.
-    LIFT           : 파지 후 PRE_PICK 높이까지 다시 상승.
-    MOVE_TO_PLACE  : place_position 상단(pre_place_z_offset)으로 수평 이동.
-    PLACE          : 저속으로 place_position까지 하강 후 그리퍼 열기.
-    POST_PLACE     : 그리퍼 오픈 후 place 위 안전 높이로 복귀.
-    HOME           : 홈 관절 각도로 복귀. 다음 사이클 준비.
-    ERROR          : 예외 발생 시 진입. 2초 간격으로 대기하며 수동 복구 안내.
-    EMERGENCY_STOP : 긴급정지 발동. e_stop_reset 서비스로만 해제 가능.
-    BACKDRIVE      : 역구동(중력보상) 모드. safety_normal 서비스로만 해제 가능.
-    """
-    IDLE           = auto()
-    DETECTING      = auto()
-    PRE_PICK       = auto()
-    PICK           = auto()
-    LIFT           = auto()
-    MOVE_TO_PLACE  = auto()
-    PLACE          = auto()
-    POST_PLACE     = auto()
-    HOME           = auto()
-    ERROR          = auto()
-    EMERGENCY_STOP = auto()
-    BACKDRIVE      = auto()
+    """Pick & Place 작업 단계를 나타내는 상태 열거형."""
+    IDLE           = 'IDLE'
+    INITIALIZING   = 'INITIALIZING' # 로봇 하드웨어 준비 중
+    DETECTING      = 'DETECTING'
+    PRE_PICK       = 'PRE_PICK'
+    PICK           = 'PICK'
+    LIFT           = 'LIFT'
+    MOVE_TO_PLACE  = 'MOVE_TO_PLACE'
+    PLACE          = 'PLACE'
+    POST_PLACE     = 'POST_PLACE'
+    HOME           = 'HOME'
+    ERROR          = 'ERROR'
+    EMERGENCY_STOP = 'EMERGENCY_STOP'
+    BACKDRIVE      = 'BACKDRIVE'
 
 
 class PickPlaceNode(Node):
@@ -111,18 +96,6 @@ class PickPlaceNode(Node):
         self.declare_parameter('cart_acc',                    200.0)
         self.declare_parameter('home_joints',                 [0.0, 0.0, 90.0, 0.0, 90.0, 0.0])
         self.declare_parameter('gripper_wait_sec',            0.8)
-        self.declare_parameter('rh12_serial_service',         '/dsr01/gripper/serial_send_data')
-        self.declare_parameter('rh12_bridge_topic',           '/gripper/rh12_stroke_cmd')
-        self.declare_parameter('rh12_allow_missing_service',  True)
-        self.declare_parameter('rh12_slave_id',               1)
-        self.declare_parameter('rh12_torque_enable_register', 256)
-        self.declare_parameter('rh12_goal_current_register',  275)
-        self.declare_parameter('rh12_stroke_register',        282)
-        self.declare_parameter('rh12_goal_current',           400)
-        self.declare_parameter('rh12_open_stroke',            700)
-        self.declare_parameter('rh12_close_stroke',           0)
-        self.declare_parameter('rh12_port',                   1)
-        self.declare_parameter('rh12_init_wait_sec',          0.1)
         self.declare_parameter('pre_pick_z_offset',           0.14)
         self.declare_parameter('pick_z_offset',               0.015)
         self.declare_parameter('grasp_rpy',                   [0.0, 180.0, 0.0])
@@ -148,18 +121,6 @@ class PickPlaceNode(Node):
         self.cacc         = self.get_parameter('cart_acc').value
         self.home_joints  = self.get_parameter('home_joints').value
         self.gripper_wait = self.get_parameter('gripper_wait_sec').value
-        self.rh12_serial_service        = self.get_parameter('rh12_serial_service').value
-        self.rh12_bridge_topic          = self.get_parameter('rh12_bridge_topic').value
-        self.rh12_allow_missing_service = self.get_parameter('rh12_allow_missing_service').value
-        self.rh12_slave_id              = self.get_parameter('rh12_slave_id').value
-        self.rh12_torque_enable_register= self.get_parameter('rh12_torque_enable_register').value
-        self.rh12_goal_current_register = self.get_parameter('rh12_goal_current_register').value
-        self.rh12_stroke_register       = self.get_parameter('rh12_stroke_register').value
-        self.rh12_goal_current          = self.get_parameter('rh12_goal_current').value
-        self.rh12_open_stroke           = self.get_parameter('rh12_open_stroke').value
-        self.rh12_close_stroke          = self.get_parameter('rh12_close_stroke').value
-        self.rh12_port                  = self.get_parameter('rh12_port').value
-        self.rh12_init_wait             = self.get_parameter('rh12_init_wait_sec').value
         self.pre_pick_dz  = self.get_parameter('pre_pick_z_offset').value
         self.pick_dz      = self.get_parameter('pick_z_offset').value
         self.grasp_rpy    = self.get_parameter('grasp_rpy').value
@@ -184,7 +145,6 @@ class PickPlaceNode(Node):
 
         self.cli_movej         = self.create_client(MoveJoint,     f'{prefix}/motion/move_joint')
         self.cli_movel         = self.create_client(MoveLine,      f'{prefix}/motion/move_line')
-        self.cli_serial_send   = self.create_client(SerialSendData, self.rh12_serial_service)
         self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
 
@@ -201,8 +161,6 @@ class PickPlaceNode(Node):
         self.cli_set_robot_ctrl  = self.create_client(SetRobotControl,   f'{prefix}/system/set_robot_control')
         self.cli_read_data_rt    = self.create_client(ReadDataRt,         f'{prefix}/realtime/read_data_rt')
 
-        self._wait_for_services()
-
         # ── 상태 변수 ───────────────────────────────────────────────────
         # state/target_pose는 상태머신 스레드와 ROS 콜백 스레드가 동시에 접근하므로 Lock 사용
         self.state       = State.IDLE
@@ -210,13 +168,14 @@ class PickPlaceNode(Node):
         self.target_pose: PoseStamped | None = None
         self.pick_requested = False
         self.pending_command: str | None = None
-        self.rh12_initialized = False
-        # rh12_lock: Open/Close 거의 동시 호출 시 Modbus 프레임 중복 발송 방지
-        self.rh12_lock   = threading.Lock()
         # 긴급정지 / 태스크 취소용 이벤트
         # _stop_event가 set되면 _call_service가 즉시 _MotionInterrupt를 발생시킨다.
         self._stop_event = threading.Event()
         self._stop_mode  = 'e_stop'  # 'e_stop' | 'cancel'
+        self._missing_startup_services: set[str] = set()
+        self._robot_mode_auto_ready = False
+        self._robot_mode_requesting = False
+        self._robot_mode_last_attempt = 0.0
         # 하드웨어 상태 캐시 (GUI 표시용)
         self._hw_state_cache: int = -1   # -1 = unknown
         self._speed_mode_cache: int = 0  # 0 = NORMAL
@@ -226,7 +185,6 @@ class PickPlaceNode(Node):
 
         # ── 퍼블리셔 / 구독 ─────────────────────────────────────────────
         self.pub_state       = self.create_publisher(String,          '/pick_place_state', 10)
-        self.pub_rh12_stroke = self.create_publisher(Int32,           self.rh12_bridge_topic, 10)
         self.pub_hw_state    = self.create_publisher(Int32,           '/robot_hw_state', 10)
         self.pub_speed_mode  = self.create_publisher(Int32,           '/robot_speed_mode', 10)
         self.pub_torque_rt   = self.create_publisher(TorqueRtStream,  f'{prefix}/torque_rt_stream', 10)
@@ -235,6 +193,8 @@ class PickPlaceNode(Node):
             self.get_parameter('selected_object_topic').value,
             10,
         )
+        self.pub_heartbeat = self.create_publisher(String, '/system/heartbeat', 10)
+        self.create_timer(1.0, self._publish_heartbeat)
         self.create_subscription(
             PoseStamped,
             self.get_parameter('target_pose_topic').value,
@@ -251,13 +211,18 @@ class PickPlaceNode(Node):
         self.create_service(Trigger, '/pick_place/safety_normal',   self._srv_safety_normal)
         self.create_service(Trigger, '/pick_place/safety_backdrive', self._srv_safety_backdrive)
 
-        # 500ms 마다 하드웨어 상태 폴링 → GUI 토픽으로 발행
-        self.create_timer(0.5, self._poll_hw_state)
+        # 1초마다 하드웨어 상태 폴링 → GUI 토픽으로 발행
+        self.create_timer(1.0, self._poll_hw_state)
+
+        # ── 서비스 대기 ─────────────────────────────────────────────
+        self._wait_for_services()
 
         # ── 상태머신 스레드 ─────────────────────────────────────────────
         # daemon=True: 메인 스레드(rclpy.spin) 종료 시 자동으로 함께 종료
         self.sm_thread = threading.Thread(target=self._state_machine_loop, daemon=True)
         self.sm_thread.start()
+
+        self.detecting_start_time = 0.0
 
         self.get_logger().info('PickPlaceNode 시작 — 상태: IDLE')
 
@@ -271,39 +236,77 @@ class PickPlaceNode(Node):
             (self.cli_gripper_open, 'gripper/open'),
             (self.cli_gripper_close, 'gripper/close'),
         ]
-        if not self.rh12_allow_missing_service:
-            required.append((self.cli_serial_send, self.rh12_serial_service))
 
         for cli, name in required:
             self.get_logger().info(f'서비스 대기 중: {name} ...')
-            while not cli.wait_for_service(timeout_sec=2.0):
-                self.get_logger().warn(f'{name} 없음, 재시도...')
+            max_retries = 30
+            for attempt in range(max_retries):
+                if cli.wait_for_service(timeout_sec=2.0):
+                    break
+                self.get_logger().warn(f'{name} 없음 ({attempt + 1}/{max_retries})')
+            else:
+                self._missing_startup_services.add(name)
+                self.get_logger().error(f'{name} 연결 실패 — 서비스 없이 계속 진행')
 
-        self.get_logger().info('컨트롤러 초기화 대기 중 (3초)...')
-        time.sleep(3.0)
-        self._set_robot_mode_auto()
-        self.get_logger().info('모든 서비스 준비 완료')
+        self.get_logger().info('기본 서비스 확인 완료. 하드웨어 동기화는 상태머신 스레드에서 진행합니다.')
 
     def _set_robot_mode_auto(self):
         """robot_mode=1(AUTO) 설정.
-
-        _call_service() 폴링 방식으로 통일해 spin()과 충돌 없이 동작.
-        별도 SingleThreadedExecutor를 생성하면 이미 spin() 중인 노드를
-        두 번째 executor에 add_node하면서 충돌이 발생하므로 폴링 방식만 사용.
+        call_async를 사용하여 타이머 콜백을 블로킹하지 않음.
         """
+        if self._robot_mode_auto_ready or self._robot_mode_requesting:
+            return
+
+        now = time.monotonic()
+        if now - self._robot_mode_last_attempt < 1.0:
+            return
+        self._robot_mode_last_attempt = now
+
         from dsr_msgs2.srv import SetRobotMode
 
-        if not self.cli_set_mode.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn('set_robot_mode 서비스 없음, 건너뜀')
+        if not self.cli_set_mode.service_is_ready():
+            self.get_logger().warn('set_robot_mode 서비스 대기 중...', throttle_duration_sec=2.0)
             return
 
         req = SetRobotMode.Request()
         req.robot_mode = 1  # DR_MODE_AUTO
-        try:
-            self._call_service(self.cli_set_mode, req, 'set_robot_mode')
-            self.get_logger().info('robot_mode=1 설정 완료 ✅')
-        except Exception as e:
-            self.get_logger().warn(f'robot_mode 설정 실패: {e}')
+        self._robot_mode_requesting = True
+
+        def _done(f):
+            self._robot_mode_requesting = False
+            try:
+                r = f.result()
+                if r.success:
+                    self._robot_mode_auto_ready = True
+                    self.get_logger().info('robot_mode=1 설정 완료 ✅')
+                    # 모드 설정 성공 시 서보 ON 추가 시도
+                    self._auto_servo_on()
+                else:
+                    self.get_logger().warn('robot_mode=1 설정 거절됨')
+            except Exception as e:
+                self.get_logger().warn(f'robot_mode 설정 실패: {e}')
+
+        self.cli_set_mode.call_async(req).add_done_callback(_done)
+
+    def _auto_servo_on(self):
+        """초기화 시 서보를 자동으로 켭니다."""
+        if not self.cli_set_robot_ctrl.service_is_ready():
+            return
+
+        req = SetRobotControl.Request()
+        req.robot_control = 3  # CONTROL_SERVO_ON
+
+        def _servo_done(f):
+            try:
+                r = f.result()
+                if r.success:
+                    self.get_logger().info('초기 서보 ON 완료 ✅')
+                else:
+                    self.get_logger().info('서보가 이미 켜져 있거나 켤 수 없는 상태입니다.')
+            except Exception:
+                pass
+
+        self.cli_set_robot_ctrl.call_async(req).add_done_callback(_servo_done)
 
     # ────────────────────────────────────────────────────────────────────
     # 콜백: 검출 포즈 수신
@@ -313,7 +316,7 @@ class PickPlaceNode(Node):
             # DETECTING 상태일 때만 새 타겟을 수신해 다음 단계로 넘어간다
             if self.state == State.DETECTING and self.pick_requested:
                 frame_id = msg.header.frame_id.strip()
-                if frame_id and frame_id != self.robot_base_frame:
+                if not frame_id or frame_id != self.robot_base_frame:
                     self.get_logger().warn(
                         f'프레임 불일치 무시: expected={self.robot_base_frame}, '
                         f'got={frame_id}'
@@ -339,6 +342,37 @@ class PickPlaceNode(Node):
     # 상태머신 루프 (별도 스레드)
     # ────────────────────────────────────────────────────────────────────
     def _state_machine_loop(self):
+        # ── 하드웨어 초기화 및 동기화 ────────────────────────────
+        self.get_logger().info('🤖 로봇 하드웨어 동기화 시작...')
+        self._set_state(State.INITIALIZING)
+
+        # rclpy.spin()이 시작된 후이므로 _poll_hw_state가 정상 동작함
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < 20.0 and rclpy.ok():
+            self._set_robot_mode_auto()
+            if self._hw_state_cache == 1:
+                self.get_logger().info('✅ 로봇 준비 완료 (STANDBY)')
+                break
+
+            if self._hw_state_cache in (5, 6, 15): # 5:SAFE_STOP, 6:E_STOP, 15:NOT_READY
+                self.get_logger().warn(f'🚨 로봇 이상 감지(상태:{self._hw_state_cache})! 자동 복구를 시도합니다...')
+                self._srv_e_stop_reset(None, Trigger.Response())
+
+            if self._hw_state_cache == 3:
+                self._auto_servo_on()
+
+            time.sleep(1.0)
+            self.get_logger().info(f'하드웨어 준비 대기 중... (상태: {HW_STATE_NAMES.get(self._hw_state_cache, "UNKNOWN")})')
+            self._publish_state(State.INITIALIZING.value)
+        else:
+            if self._hw_state_cache != 1:
+                self.get_logger().error('❌ 로봇 하드웨어 준비 실패.')
+                self._set_state(State.ERROR)
+                # 에러 상태에서도 루프는 계속 돌려 수동 복구 대기
+
+        if self.state == State.INITIALIZING:
+            self._set_state(State.IDLE)
+
         while rclpy.ok():
             command = self._pop_pending_command()
             if command is not None:
@@ -359,7 +393,7 @@ class PickPlaceNode(Node):
                 current = self.state
 
             # 현재 상태를 토픽으로 발행 → 외부 모니터링 용이
-            self._publish_state(current.name)
+            self._publish_state(current.name if isinstance(current, State) else str(current))
 
             try:
                 if current == State.IDLE:
@@ -367,6 +401,12 @@ class PickPlaceNode(Node):
 
                 elif current == State.DETECTING:
                     time.sleep(0.1)  # 포즈 콜백 대기 (CPU 점유 최소화)
+
+                    if hasattr(self, 'detecting_start_time') and self.detecting_start_time > 0:
+                        if time.monotonic() - self.detecting_start_time > 10.0:
+                            self.get_logger().error('타겟 좌표 수신 타임아웃 (10초 초과). 카메라 연결 또는 검출 실패. IDLE 상태로 복귀합니다.')
+                            self._finish_cycle()
+                            continue
 
                 elif current == State.PRE_PICK:
                     # 물체 위 안전 높이까지 먼저 접근. 그리퍼를 미리 열어 충돌 예방.
@@ -432,9 +472,11 @@ class PickPlaceNode(Node):
                     time.sleep(2.0)
 
                 elif current == State.EMERGENCY_STOP:
-                    self.get_logger().error(
-                        '긴급정지 상태. /pick_place/e_stop_reset 서비스로 해제하세요.')
-                    time.sleep(1.0)
+                    self.get_logger().warn(
+                        '긴급정지 상태. /pick_place/e_stop_reset 서비스로 해제하세요.',
+                        throttle_duration_sec=5.0,
+                    )
+                    time.sleep(0.2)
 
                 elif current == State.BACKDRIVE:
                     time.sleep(0.5)  # 역구동 루프는 별도 스레드 — 여기서는 대기만
@@ -448,6 +490,9 @@ class PickPlaceNode(Node):
                     except Exception as e2:
                         self.get_logger().warn(f'하드웨어 정지 실패 (무시): {e2}')
                     self._set_state(State.EMERGENCY_STOP)
+                elif mi.mode == 'backdrive':
+                    self.get_logger().info('역구동 전환: 진행 중 모션 중단 완료')
+                    self._set_state(State.BACKDRIVE)
                 else:
                     self.get_logger().info('태스크 취소: 그리퍼 열고 홈으로 복귀 중...')
                     try:
@@ -464,7 +509,8 @@ class PickPlaceNode(Node):
     def _set_state(self, s: State):
         with self.state_lock:
             self.state = s
-        self.get_logger().info(f'→ 상태 전환: {s.name}')
+        self._publish_state(s.value)
+        self.get_logger().info(f'→ 상태 전환: {s.value}')
 
     def _enqueue_command(self, command: str) -> bool:
         with self.state_lock:
@@ -482,10 +528,13 @@ class PickPlaceNode(Node):
     def _execute_manual_command(self, command: str):
         if command == 'run_once':
             self.get_logger().info('1회 Pick & Place 요청 수신')
+            if not self._ensure_robot_mode_auto_ready(timeout=5.0):
+                raise RuntimeError('robot_mode=AUTO 준비 전입니다. 잠시 후 다시 시도하세요.')
             self._clear_target()
             self.pick_requested = True
             self._set_state(State.HOME)
             self._go_home()
+            self.detecting_start_time = time.monotonic()
             self._set_state(State.DETECTING)
             return
 
@@ -500,6 +549,15 @@ class PickPlaceNode(Node):
             return
 
         raise RuntimeError(f'알 수 없는 명령: {command}')
+
+    def _ensure_robot_mode_auto_ready(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while rclpy.ok() and time.monotonic() < deadline:
+            self._set_robot_mode_auto()
+            if self._robot_mode_auto_ready:
+                return True
+            time.sleep(0.1)
+        return self._robot_mode_auto_ready
 
     def _clear_target(self):
         with self.state_lock:
@@ -548,12 +606,6 @@ class PickPlaceNode(Node):
         return res
 
     def _srv_e_stop(self, _, res: Trigger.Response):
-        """긴급정지: 현재 모션을 즉시 중단하고 EMERGENCY_STOP 상태로 진입.
-
-        _stop_event를 set해 _call_service 폴링 루프를 깨고
-        동시에 state를 직접 EMERGENCY_STOP으로 전환하여
-        상태머신이 대기(sleep) 중일 때도 즉시 인지하게 한다.
-        """
         self._stop_mode = 'e_stop'
         self._stop_event.set()
         with self.state_lock:
@@ -566,10 +618,6 @@ class PickPlaceNode(Node):
         return res
 
     def _srv_cancel(self, _, res: Trigger.Response):
-        """태스크 취소: 현재 모션 완료 후 그리퍼를 열고 홈으로 복귀.
-
-        IDLE 또는 EMERGENCY_STOP 상태에서는 취소할 태스크가 없으므로 거절한다.
-        """
         with self.state_lock:
             current = self.state
         if current in (State.IDLE, State.EMERGENCY_STOP):
@@ -583,34 +631,44 @@ class PickPlaceNode(Node):
         return res
 
     def _srv_e_stop_reset(self, _, res: Trigger.Response):
-        """긴급정지 해제: EMERGENCY_STOP 상태에서 IDLE로 복귀."""
+        """실제 하드웨어 알람 리셋 후 상태를 IDLE로 복구합니다."""
         with self.state_lock:
-            if self.state != State.EMERGENCY_STOP:
-                res.success = False
-                res.message = '긴급정지 상태가 아닙니다.'
-                return res
             self._stop_event.clear()
+            self.pending_command = None
             self.pick_requested = False
             self.target_pose = None
+
+        if self.cli_set_robot_ctrl.service_is_ready():
+            req = SetRobotControl.Request()
+            req.robot_control = 1 # 1: CONTROL_RESET_ALARM
+
+            def _reset_done(future):
+                try:
+                    result = future.result()
+                    if result.success:
+                        self.get_logger().info('하드웨어 알람 리셋 요청 성공')
+                    else:
+                        self.get_logger().warn('하드웨어 알람 리셋 요청 거절')
+                except Exception as e:
+                    self.get_logger().error(f'하드웨어 리셋 응답 오류: {e}')
+
+            self.cli_set_robot_ctrl.call_async(req).add_done_callback(_reset_done)
+        else:
+            self.get_logger().warn('set_robot_control 서비스 미연결. 앱 상태만 복구합니다.')
+
+        with self.state_lock:
             self.state = State.IDLE
-        self.get_logger().info('✅ 긴급정지 해제. IDLE 상태로 복귀.')
+
+        self._publish_state(State.IDLE.value)
+        self.get_logger().info('✅ 알람 리셋 요청됨. IDLE 상태로 복귀.')
         res.success = True
-        res.message = '긴급정지 해제 완료. IDLE 상태입니다.'
+        res.message = '하드웨어 알람 리셋 요청 및 상태 복구 완료.'
         return res
 
-    # ────────────────────────────────────────────────────────────────────
-    # 안전 모드 서비스 핸들러
-    # ────────────────────────────────────────────────────────────────────
     def _srv_speed_normal(self, _, res: Trigger.Response):
-        """속도 모드: 정상 속도(SPEED_NORMAL_MODE=0)로 전환."""
         return self._set_speed_mode(0, res, '정상 속도')
 
     def _srv_speed_reduced(self, _, res: Trigger.Response):
-        """속도 모드: 감속 모드(SPEED_REDUCED_MODE=1)로 전환.
-
-        협업 작업 시 인간이 작업 공간에 접근할 때 사용.
-        로봇이 설정된 안전 속도 이하로 동작한다.
-        """
         return self._set_speed_mode(1, res, '감속 모드')
 
     def _set_speed_mode(self, mode: int, res: Trigger.Response, label: str):
@@ -636,18 +694,12 @@ class PickPlaceNode(Node):
         return res
 
     def _srv_servo_off(self, _, res: Trigger.Response):
-        """서보 OFF: 모든 관절 모터 전원 차단 (SAFE TORQUE OFF).
-
-        stop_type=0 (STOP_TYPE_QUICK_STO): 빠른 정지 후 STO.
-        실행 후 STATE_SAFE_OFF(3)로 전환된다.
-        복구는 servo_on (/pick_place/servo_on) 서비스로 가능하다.
-        """
         if not self.cli_servo_off.service_is_ready():
             res.success = False
             res.message = 'servo_off 서비스 미연결.'
             return res
         req = ServoOff.Request()
-        req.stop_type = 0  # STOP_TYPE_QUICK_STO
+        req.stop_type = 0
 
         def _done(f):
             try:
@@ -657,7 +709,6 @@ class PickPlaceNode(Node):
                 self.get_logger().error(f'servo_off 콜백 오류: {e}')
 
         self.cli_servo_off.call_async(req).add_done_callback(_done)
-        # pick_place 상태도 EMERGENCY_STOP으로 전환 (태스크 재개 방지)
         with self.state_lock:
             self.state = State.EMERGENCY_STOP
             self.pick_requested = False
@@ -666,18 +717,12 @@ class PickPlaceNode(Node):
         return res
 
     def _srv_servo_on(self, _, res: Trigger.Response):
-        """서보 ON: 서보 OFF 후 관절 모터를 다시 켠다.
-
-        SetRobotControl(CONTROL_SERVO_ON = CONTROL_RESET_SAFET_OFF = 3) 호출.
-        로봇 하드웨어 상태가 STATE_SAFE_OFF(3) 또는 STATE_SAFE_OFF2(10)일 때만 유효하다.
-        성공 시 STATE_STANDBY(1)로 복귀하고 pick_place 상태도 IDLE로 전환된다.
-        """
         if not self.cli_set_robot_ctrl.service_is_ready():
             res.success = False
             res.message = 'set_robot_control 서비스 미연결.'
             return res
         req = SetRobotControl.Request()
-        req.robot_control = 3  # CONTROL_SERVO_ON = CONTROL_RESET_SAFET_OFF
+        req.robot_control = 3
 
         def _done(f):
             try:
@@ -697,12 +742,8 @@ class PickPlaceNode(Node):
         res.message = '서보 ON 요청됨. 응답 후 IDLE 상태로 복귀합니다.'
         return res
 
-    # ── Doosan 로봇 모드 전환 ─────────────────────────────────────────────────
     def _srv_safety_normal(self, _, res: Trigger.Response):
-        """정상 운전 모드 복귀: 역구동 중력보상 루프 정지 후 AUTONOMOUS 모드 설정."""
-        # 역구동 루프 중단
         self._backdrive_active.clear()
-        # 픽앤플레이스 상태도 IDLE로 초기화
         with self.state_lock:
             self._stop_event.clear()
             self.pick_requested = False
@@ -711,29 +752,23 @@ class PickPlaceNode(Node):
         return self._set_robot_mode(1, res, '정상 운전 (AUTONOMOUS)')
 
     def _srv_safety_backdrive(self, _, res: Trigger.Response):
-        """역구동 모드: 중력보상 토크를 실시간으로 스트리밍해 로봇을 자유롭게 이동시킨다.
-
-        SetRobotMode/SetSafetyMode로는 실제 역구동이 동작하지 않는다.
-        실제 구현: ReadDataRt로 gravity_torque를 읽어 TorqueRtStream 토픽으로
-        지속 발행 → 컨트롤러가 중력을 보상해 외력으로 자유롭게 가이딩 가능.
-        (dsr_realtime_control/GravityCompensation 예제와 동일 방식)
-        """
-        # 진행 중인 모션 중단
-        self._stop_mode = 'e_stop'
-        self._stop_event.set()
-        with self.state_lock:
-            self.state = State.BACKDRIVE
-            self.pick_requested = False
-            self.pending_command = None
-        self._stop_event.clear()  # 역구동 루프 내부 polling 방해 방지
-
-        # ReadDataRt 서비스 가용 여부 확인
         if not self.cli_read_data_rt.service_is_ready():
             res.success = False
             res.message = 'realtime/read_data_rt 서비스 미연결. 역구동 불가.'
             return res
 
-        # 중력보상 루프 시작
+        try:
+            self._hw_move_stop(stop_mode=0)
+        except Exception as e:
+            self.get_logger().warn(f'역구동 전환 전 move_stop 실패 (계속 진행): {e}')
+
+        self._stop_mode = 'backdrive'
+        self._stop_event.set()
+        with self.state_lock:
+            self.state = State.BACKDRIVE
+            self.pick_requested = False
+            self.pending_command = None
+
         self._backdrive_active.set()
         if self._backdrive_thread is None or not self._backdrive_thread.is_alive():
             self._backdrive_thread = threading.Thread(
@@ -745,18 +780,9 @@ class PickPlaceNode(Node):
         return res
 
     def _backdrive_loop(self):
-        """중력보상(역구동) 루프: gravity_torque를 읽어 TorqueRtStream으로 발행.
-
-        ReadDataRt 서비스로 6축 gravity_torque를 읽고,
-        해당 토크값을 그대로 TorqueRtStream 토픽으로 발행한다.
-        이렇게 하면 로봇이 중력을 스스로 보상하여 외력으로 자유롭게 이동 가능.
-        100Hz(10ms)로 동작. _backdrive_active.clear() 시 종료.
-        """
         self.get_logger().info('역구동 루프 시작 (중력보상 토크 스트리밍)')
-        gravity = [0.0] * 6  # 마지막으로 읽은 gravity_torque 캐시
-
+        gravity = [0.0] * 6
         while self._backdrive_active.is_set() and rclpy.ok():
-            # ── gravity_torque 읽기 ──────────────────────────────────────
             if self.cli_read_data_rt.service_is_ready():
                 future = self.cli_read_data_rt.call_async(ReadDataRt.Request())
                 deadline = time.monotonic() + 0.2
@@ -767,7 +793,6 @@ class PickPlaceNode(Node):
                     if time.monotonic() >= deadline:
                         break
                     time.sleep(0.002)
-
                 if future.done():
                     try:
                         r = future.result()
@@ -775,19 +800,14 @@ class PickPlaceNode(Node):
                             gravity = list(r.data.gravity_torque)
                     except Exception:
                         pass
-
-            # ── 중력 토크 그대로 발행 ────────────────────────────────────
             msg = TorqueRtStream()
             msg.tor = gravity
             msg.time = 0.0
             self.pub_torque_rt.publish(msg)
-
-            time.sleep(0.01)  # 100 Hz
-
+            time.sleep(0.01)
         self.get_logger().info('역구동 루프 종료')
 
     def _set_robot_mode(self, mode: int, res: Trigger.Response, label: str):
-        """SetRobotMode 서비스 공통 호출 헬퍼."""
         if not self.cli_set_mode.service_is_ready():
             res.success = False
             res.message = 'set_robot_mode 서비스 미연결.'
@@ -795,7 +815,6 @@ class PickPlaceNode(Node):
         from dsr_msgs2.srv import SetRobotMode
         req = SetRobotMode.Request()
         req.robot_mode = mode
-
         def _done(f):
             try:
                 r = f.result()
@@ -805,34 +824,21 @@ class PickPlaceNode(Node):
                     self.get_logger().warn(f'로봇 모드 → {label} 전환 거절 (현재 상태 확인 필요)')
             except Exception as e:
                 self.get_logger().error(f'set_robot_mode 콜백 오류: {e}')
-
         self.cli_set_mode.call_async(req).add_done_callback(_done)
         res.success = True
         res.message = f'로봇 모드 → {label} 전환 요청됨.'
         return res
 
     def _hw_move_stop(self, stop_mode: int = 0):
-        """Doosan 컨트롤러에 직접 모션 정지 명령.
-
-        _stop_event 해제 후 호출해야 한다(이미 clear 된 상태).
-        stop_mode 0 = DR_QSTOP_STO (빠른 정지 + STO)
-        """
         if not self.cli_move_stop.service_is_ready():
-            self.get_logger().warn('move_stop 서비스 미연결, 하드웨어 정지 건너뜀')
             return
         req = MoveStop.Request()
         req.stop_mode = stop_mode
         self._call_service(self.cli_move_stop, req, f'move_stop(mode={stop_mode})', timeout=5.0)
 
     def _poll_hw_state(self):
-        """500ms 주기로 로봇 하드웨어 상태와 속도 모드를 폴링해 토픽으로 발행.
-
-        서비스가 준비되지 않았거나 호출 실패 시 조용히 무시한다.
-        GUI는 이 토픽을 구독해 실시간 상태를 표시한다.
-        """
         if self.cli_get_robot_state.service_is_ready():
             f = self.cli_get_robot_state.call_async(GetRobotState.Request())
-
             def _state_cb(fut):
                 try:
                     r = fut.result()
@@ -843,12 +849,9 @@ class PickPlaceNode(Node):
                         self.pub_hw_state.publish(msg)
                 except Exception:
                     pass
-
             f.add_done_callback(_state_cb)
-
         if self.cli_get_speed_mode.service_is_ready():
             f = self.cli_get_speed_mode.call_async(GetRobotSpeedMode.Request())
-
             def _speed_cb(fut):
                 try:
                     r = fut.result()
@@ -859,7 +862,6 @@ class PickPlaceNode(Node):
                         self.pub_speed_mode.publish(msg)
                 except Exception:
                     pass
-
             f.add_done_callback(_speed_cb)
 
     def _publish_state(self, name: str):
@@ -867,61 +869,30 @@ class PickPlaceNode(Node):
         msg.data = name
         self.pub_state.publish(msg)
 
-    # ────────────────────────────────────────────────────────────────────
-    # 로봇 모션 헬퍼
-    # ────────────────────────────────────────────────────────────────────
     def _go_home(self):
-        """홈 관절 각도로 이동.
-
-        MoveJoint 파라미터:
-          pos       : 목표 관절 각도 6개 (deg)
-          vel       : 관절 속도 (deg/s)
-          acc       : 관절 가속도 (deg/s²)
-          time      : 0.0 → vel/acc 기반 자동 계산
-          radius    : 0.0 → 블렌딩 없음
-          mode      : 0 = MOVE_MODE_ABSOLUTE
-          blendType : 0 (Doosan 필드명 camelCase)
-          syncType  : 0 = 동기 블로킹 (Doosan 필드명 camelCase)
-        """
         req = MoveJoint.Request()
         req.pos       = [float(v) for v in self.home_joints]
         req.vel       = self.jvel
         req.acc       = self.jacc
         req.time      = 0.0
         req.radius    = 0.0
-        req.mode      = 0        # MOVE_MODE_ABSOLUTE
-        req.blend_type = 0        # ← Doosan 공식 camelCase
-        req.sync_type  = 0        # ← Doosan 공식 camelCase (동기 블로킹)
+        req.mode      = 0
+        req.blend_type = 0
+        req.sync_type  = 0
         self._call_service(self.cli_movej, req, 'move_joint(home)', timeout=30.0)
 
     def _move_to_cart(self, x, y, z, rpy, vel=None, acc=None):
-        """Cartesian 직선 이동 (로봇 베이스 프레임 기준).
-
-        인자:
-          x, y, z : 목표 위치 (m 단위 → 내부에서 mm 변환)
-          rpy     : [rx, ry, rz] 방향 (deg)
-          vel     : 선속도(mm/s). None이면 cart_vel 파라미터 사용.
-          acc     : 선가속도(mm/s²). None이면 cart_acc 파라미터 사용.
-
-        Doosan MoveLine 서비스 단위:
-          위치: mm (ROS 관례 m → x*1000 변환 필수)
-          vel : [선속도 mm/s, 각속도 deg/s]
-          acc : [선가속도 mm/s², 각가속도 deg/s²]
-          ref : 0 = DR_BASE (로봇 베이스 좌표계)
-          mode: 0 = DR_MV_MOD_ABS (절대 좌표)
-          blendType / syncType : Doosan 공식 camelCase 필드명
-        """
         req = MoveLine.Request()
         req.pos       = [x * 1000.0, y * 1000.0, z * 1000.0,
                          float(rpy[0]), float(rpy[1]), float(rpy[2])]
-        req.vel       = [vel if vel else self.cvel, 30.0]   # [선속도, 각속도]
-        req.acc       = [acc if acc else self.cacc, 60.0]   # [선가속도, 각가속도]
+        req.vel       = [vel if vel else self.cvel, 30.0]
+        req.acc       = [acc if acc else self.cacc, 60.0]
         req.time      = 0.0
         req.radius    = 0.0
-        req.ref       = 0        # DR_BASE
-        req.mode      = 0        # DR_MV_MOD_ABS
-        req.blend_type = 0        # ← Doosan 공식 camelCase
-        req.sync_type  = 0        # ← Doosan 공식 camelCase (동기 블로킹)
+        req.ref       = 0
+        req.mode      = 0
+        req.blend_type = 0
+        req.sync_type  = 0
         self._call_service(self.cli_movel, req,
                            f'move_line({x:.3f},{y:.3f},{z:.3f})', timeout=30.0)
 
@@ -929,15 +900,10 @@ class PickPlaceNode(Node):
         rpy = [float(v) for v in self.grasp_rpy]
         if not self.use_target_pose_yaw:
             return rpy
-
         yaw_deg = self._yaw_deg_from_pose(pose)
         if yaw_deg is None:
             return rpy
-
         rpy[2] = self._wrap_deg(rpy[2] + yaw_deg + float(self.grasp_yaw_offset_deg))
-        self.get_logger().info(
-            f'그리퍼 yaw 적용: target={yaw_deg:+.1f} deg, cmd_rz={rpy[2]:+.1f} deg'
-        )
         return rpy
 
     def _yaw_deg_from_pose(self, pose: PoseStamped) -> float | None:
@@ -956,16 +922,8 @@ class PickPlaceNode(Node):
         return ((float(angle_deg) + 180.0) % 360.0) - 180.0
 
     def _call_service(self, cli, req, name: str, timeout: float = 15.0):
-        """ROS 2 서비스를 call_async() + 폴링 방식으로 호출.
-
-        spin()은 메인 스레드, 상태머신은 daemon 스레드에서 실행되므로
-        call_sync()를 사용할 수 없다.
-        call_async()로 요청 후 future.done()을 0.05초 간격으로 폴링하며
-        spin()이 future를 완료 상태로 만들기를 기다린다.
-
-        timeout 기본값 15초, 모션 서비스는 30초로 호출 (장거리 이동 대비).
-        타임아웃 초과 시 RuntimeError → 상태머신 ERROR 진입.
-        """
+        if not cli.service_is_ready():
+            raise RuntimeError(f'{name}: 서비스 미연결')
         future   = cli.call_async(req)
         deadline = time.monotonic() + timeout
         while rclpy.ok() and not future.done():
@@ -975,7 +933,6 @@ class PickPlaceNode(Node):
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.05)
-
         if not future.done():
             future.cancel()
             raise RuntimeError(f'{name}: 타임아웃 ({timeout:.0f}s)')
@@ -986,157 +943,49 @@ class PickPlaceNode(Node):
             raise RuntimeError(f'{name}: success=False')
         return res
 
-    # ────────────────────────────────────────────────────────────────────
-    # 그리퍼 제어
-    # ────────────────────────────────────────────────────────────────────
+    def _call_service_with_retry(self, cli, req, name: str, timeout: float = 10.0, max_retries: int = 3):
+        """서비스 호출 실패 시 일정 시간 대기 후 재시도합니다."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                return self._call_service(cli, req, name, timeout)
+            except RuntimeError as e:
+                # _MotionInterrupt(긴급정지/취소)는 RuntimeError 상속이 아니므로 여기서 잡히지 않고 그대로 상위로 전파됨
+                if attempt == max_retries:
+                    self.get_logger().error(f'{name} 최종 실패 ({max_retries}회 재시도 초과): {e}')
+                    raise
+                self.get_logger().warn(f'{name} 실패 ({e}). {attempt}/{max_retries} 재시도 중... (1초 대기)')
+                time.sleep(1.0)
+
     def _gripper_open(self):
-        """gripper_node의 /gripper/open 서비스를 호출해 그리퍼를 연다."""
         self.get_logger().info('그리퍼 열기')
-        self._call_service(self.cli_gripper_open, Trigger.Request(), 'gripper/open')
+        self._call_service_with_retry(self.cli_gripper_open, Trigger.Request(), 'gripper/open', timeout=20.0)
         time.sleep(self.gripper_wait)
 
     def _gripper_close(self):
-        """gripper_node의 /gripper/close 서비스를 호출해 그리퍼를 닫는다."""
+        """Trigger 서비스를 통해 그리퍼를 닫습니다."""
         self.get_logger().info('그리퍼 닫기')
-        self._call_service(self.cli_gripper_close, Trigger.Request(), 'gripper/close')
+        self._call_service_with_retry(self.cli_gripper_close, Trigger.Request(), 'gripper/close', timeout=20.0)
         time.sleep(self.gripper_wait)
 
-    def _rh12_move(self, stroke: int):
-        """RH-P12-Rn 스트로크 직접 제어 (serial 서비스 또는 bridge 토픽).
-
-        stroke 범위: 0 (완전 닫힘) ~ 700 (완전 열림)
-
-        우선순위:
-          1. SerialSendData 서비스가 준비된 경우 → Modbus FC16 직접 전송
-          2. 서비스 없을 경우 → bridge 토픽(/gripper/rh12_stroke_cmd)으로 대체 발행
-
-        payload는 lock 밖에서 미리 생성해 NameError 방지.
-        """
-        stroke = max(0, min(700, int(stroke)))
-        # payload를 lock 밖에서 미리 생성 → serial 서비스/bridge 양쪽에서 재사용
-        payload = self._modbus_fc16(
-            self.rh12_slave_id, self.rh12_stroke_register, [stroke, 0])
-
-        with self.rh12_lock:
-            if self.cli_serial_send.service_is_ready():
-                self._ensure_rh12_initialized()
-                req = SerialSendData.Request()
-                # dsr_msgs2 SerialSendData.data 타입이 string → latin-1로 raw bytes 전달
-                req.data = payload.decode('latin-1')
-                self.get_logger().info(
-                    f'RH-P12-Rn serial 전송: stroke={stroke}, frame={payload.hex()}')
-                try:
-                    self._call_service(self.cli_serial_send, req,
-                                       f'rh12_serial_send(stroke={stroke})')
-                    return
-                except Exception as e:
-                    self.get_logger().warn(f'SerialSendData 오류: {e}')
-
-        # serial 서비스 미준비 시 bridge 토픽으로 대체
-        msg = Int32()
-        msg.data = stroke
-        self.pub_rh12_stroke.publish(msg)
-        self.get_logger().warn(
-            f'bridge 토픽으로 대체 발행: stroke={stroke}, '
-            f'topic={self.rh12_bridge_topic}, frame={payload.hex()}')
-
-    def _ensure_rh12_initialized(self):
-        """RH-P12-Rn Torque Enable + Goal Current 최초 1회 초기화.
-
-        초기화 순서 (Modbus FC06 Single Register Write):
-          1. Torque Enable (reg 256, value=1)  : 모터 전원 활성화
-          2. Goal Current  (reg 275, value=400): 파지력 전류 제한 설정
-        rh12_init_wait(기본 0.1초): 레지스터 쓰기 후 그리퍼 내부 처리 시간 확보.
-        """
-        if self.rh12_initialized:
-            return
-        self._rh12_send_frame(
-            self._modbus_fc06(self.rh12_slave_id,
-                              self.rh12_torque_enable_register, 1),
-            'rh12_torque_enable')
-        time.sleep(self.rh12_init_wait)
-        self._rh12_send_frame(
-            self._modbus_fc06(self.rh12_slave_id,
-                              self.rh12_goal_current_register,
-                              self.rh12_goal_current),
-            'rh12_goal_current')
-        time.sleep(self.rh12_init_wait)
-        self.rh12_initialized = True
-        self.get_logger().info('RH-P12-Rn 초기화 완료')
-
-    def _rh12_send_frame(self, payload: bytes, name: str):
-        req = SerialSendData.Request()
-        req.data = payload.decode('latin-1')
-        self.get_logger().info(f'RH-P12-Rn frame 전송: {name}, frame={payload.hex()}')
-        self._call_service(self.cli_serial_send, req, name)
-
-    def _modbus_fc06(self, slave_id: int, register: int, value: int) -> bytes:
-        """Modbus RTU FC06 (Write Single Register) 프레임 생성.
-
-        프레임 구조 (8바이트):
-          [Slave ID (1)] [0x06 (1)] [Register Addr (2, big-endian)]
-          [Value (2, big-endian)] [CRC16 (2, little-endian)]
-
-        예) slave=1, reg=256, val=1 → 01 06 01 00 00 01 [CRC_LO] [CRC_HI]
-        """
-        frame = bytearray([slave_id & 0xFF, 0x06])
-        frame.extend(int(register).to_bytes(2, 'big'))
-        frame.extend(int(value).to_bytes(2, 'big'))
-        frame.extend(self._modbus_crc16(frame).to_bytes(2, 'little'))
-        return bytes(frame)
-
-    def _modbus_fc16(self, slave_id: int, start_register: int,
-                     values: list[int]) -> bytes:
-        """Modbus RTU FC16 (Write Multiple Registers) 프레임 생성.
-
-        Doosan DART 예시의 modbus_fc16(282, 2, 2, [stroke, 0])와 동일 동작.
-
-        프레임 구조:
-          [Slave ID (1)] [0x10 (1)] [Start Reg (2, big-endian)]
-          [Reg Count (2, big-endian)] [Byte Count (1)]
-          [Value0 (2, big-endian)] ... [CRC16 (2, little-endian)]
-
-        예) slave=1, start_reg=282, values=[700, 0] (열기):
-          01 10 01 1A 00 02 04 02 BC 00 00 [CRC_LO] [CRC_HI]
-        """
-        rc         = len(values)
-        byte_count = rc * 2
-        frame = bytearray([slave_id & 0xFF, 0x10])
-        frame.extend(start_register.to_bytes(2, 'big'))
-        frame.extend(rc.to_bytes(2, 'big'))
-        frame.append(byte_count & 0xFF)
-        for v in values:
-            frame.extend(int(v).to_bytes(2, 'big'))
-        frame.extend(self._modbus_crc16(frame).to_bytes(2, 'little'))
-        return bytes(frame)
-
-    def _modbus_crc16(self, data: bytes) -> int:
-        """Modbus RTU CRC-16/IBM 체크섬 계산.
-
-        알고리즘: CRC-16/IBM (반사 다항식 0xA001 = 0x8005 반사)
-          초기값 0xFFFF, 각 바이트 XOR 후 8회 비트 시프트.
-        반환: 16비트 CRC (little-endian으로 프레임 뒤에 붙임)
-        """
-        crc = 0xFFFF
-        for b in data:
-            crc ^= b
-            for _ in range(8):
-                crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
-        return crc & 0xFFFF
-
+    def _publish_heartbeat(self):
+        msg = String()
+        msg.data = 'pick_place_node'
+        self.pub_heartbeat.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)
+    from rclpy.executors import MultiThreadedExecutor
     node = PickPlaceNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         if rclpy.ok():
             node.destroy_node()
             rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
