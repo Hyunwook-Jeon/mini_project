@@ -1103,11 +1103,13 @@ class PickPlaceGui(QWidget):
         # ── 수동 제어 버튼 ────────────────────────────────────────────
         manual_enabled = state in ('IDLE', 'DETECTING', 'ERROR') and not self._reset_in_progress and hw not in (6, 15)
         manual_busy = self._manual_command is not None
-        self.home_button.setEnabled(manual_enabled and not manual_busy)
-        self.gripper_open_button.setEnabled(manual_enabled and not manual_busy)
-        self.gripper_close_button.setEnabled(manual_enabled and not manual_busy)
+        command_enabled = manual_enabled and not manual_busy
+        object_buttons_enabled = command_enabled and is_idle
+        self.home_button.setEnabled(command_enabled)
+        self.gripper_open_button.setEnabled(command_enabled)
+        self.gripper_close_button.setEnabled(command_enabled)
         self._update_manual_button_texts()
-        self.auto_button.setEnabled(is_idle)
+        self.auto_button.setEnabled(command_enabled and is_idle)
 
         # ── 안전 모드 버튼 ────────────────────────────────────────────
         # 속도 모드: EMERGENCY_STOP이 아닐 때 전환 가능
@@ -1182,7 +1184,7 @@ class PickPlaceGui(QWidget):
             if label not in labels:
                 labels.append(label)
 
-        self._refresh_buttons(self._stable_detection_labels(labels))
+        self._refresh_buttons(self._stable_detection_labels(labels), object_buttons_enabled)
         self._refresh_summary()
 
     def _update_manual_command_feedback(self, state: str):
@@ -1243,7 +1245,7 @@ class PickPlaceGui(QWidget):
 
         return self._stable_labels
 
-    def _refresh_buttons(self, labels: list):
+    def _refresh_buttons(self, labels: list, enabled: bool):
         """검출된 라벨 목록에 맞게 버튼을 생성/표시/강조한다.
 
         버튼 관리 전략:
@@ -1266,7 +1268,7 @@ class PickPlaceGui(QWidget):
                 button.clicked.connect(lambda checked=False, text=label: self._select_label(text))
                 self.object_buttons[label] = button
             button.setVisible(True)
-            button.setEnabled(self.ros_node.pick_place_state == 'IDLE')
+            button.setEnabled(enabled)
             if label == self.ros_node.selected_label and self.ros_node.selected_label:
                 button.setStyleSheet(
                     'background-color: #1f6feb; color: white; font-weight: bold;'

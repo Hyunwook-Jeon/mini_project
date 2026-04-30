@@ -612,6 +612,8 @@ class PickPlaceNode(Node):
             self.state = State.EMERGENCY_STOP
             self.pick_requested = False
             self.pending_command = None
+            self.target_pose = None
+        self._clear_selected_label()
         self.get_logger().error('⛔ 긴급정지 발동!')
         res.success = True
         res.message = '긴급정지 발동. /pick_place/e_stop_reset 서비스로 해제하세요.'
@@ -620,12 +622,16 @@ class PickPlaceNode(Node):
     def _srv_cancel(self, _, res: Trigger.Response):
         with self.state_lock:
             current = self.state
-        if current in (State.IDLE, State.EMERGENCY_STOP):
-            res.success = False
-            res.message = '취소할 진행 중인 태스크가 없습니다.'
-            return res
+            if current in (State.IDLE, State.EMERGENCY_STOP):
+                res.success = False
+                res.message = '취소할 진행 중인 태스크가 없습니다.'
+                return res
+            self.pick_requested = False
+            self.pending_command = None
+            self.target_pose = None
         self._stop_mode = 'cancel'
         self._stop_event.set()
+        self._clear_selected_label()
         res.success = True
         res.message = '태스크 취소 요청. 현재 모션 완료 후 그리퍼 열고 홈으로 복귀합니다.'
         return res
