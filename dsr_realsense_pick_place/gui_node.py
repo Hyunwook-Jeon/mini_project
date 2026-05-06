@@ -65,10 +65,13 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QDoubleSpinBox,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -78,6 +81,8 @@ from PyQt5.QtCore import QLibraryInfo
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
+from rcl_interfaces.msg import Parameter as RclParameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
 from std_msgs.msg import Int32, String
 
 from std_srvs.srv import Trigger
@@ -145,6 +150,8 @@ class PickPlaceGuiNode(Node):
         self.cli_servo_on         = self.create_client(Trigger, '/pick_place/servo_on')
         self.cli_safety_normal    = self.create_client(Trigger, '/pick_place/safety_normal')
         self.cli_safety_backdrive = self.create_client(Trigger, '/pick_place/safety_backdrive')
+        self.cli_object_get_parameters = self.create_client(GetParameters, '/object_detector/get_parameters')
+        self.cli_object_set_parameters = self.create_client(SetParameters, '/object_detector/set_parameters')
 
         # 로봇 하드웨어 상태 / 속도 모드 (pick_place_node 폴링 결과 수신)
         self.hw_state   = -1   # -1 = unknown
@@ -622,6 +629,13 @@ class PickPlaceGui(QWidget):
         self._candidate_labels = []
         self._candidate_label_hits = 0
         self._label_stable_frames = 3
+        self._settings_path = Path.home() / '.config' / 'dsr_realsense_pick_place' / 'gui_settings.json'
+        self._settings = self._load_gui_settings()
+        self._calib_current_mm = [None, None, None]
+        self._object_settings_loaded = False
+        self._object_settings_loading = False
+        self._saved_model_applied = False
+        self._last_object_settings_attempt = 0.0
 
         # 좌측은 카메라 영상, 우측은 상태/선택 패널로 나누어 배치한다.
         self.setWindowTitle('DSR RealSense Pick & Place GUI')
@@ -649,6 +663,81 @@ class PickPlaceGui(QWidget):
             self.system_status_labels[key] = label
             status_bar_layout.addWidget(label)
         left_box.addWidget(self.system_status_bar, 0, Qt.AlignLeft)
+
+        compact_settings_group = QGroupBox('모델 설정 / 수동 캘리브레이션')
+        compact_settings_group.setMaximumHeight(108)
+        compact_settings_layout = QVBoxLayout(compact_settings_group)
+        compact_settings_layout.setContentsMargins(8, 5, 8, 5)
+        compact_settings_layout.setSpacing(3)
+
+        model_row = QHBoxLayout()
+        model_row.setSpacing(4)
+        model_label = QLabel('모델')
+        model_label.setFixedWidth(54)
+        model_row.addWidget(model_label)
+        self.model_path_edit = QLineEdit(str(self._settings.get('yolo_model_path', '')))
+        self.model_path_edit.setPlaceholderText('YOLO .pt 파일 경로')
+        self.model_path_edit.setFixedHeight(24)
+        self.model_path_edit.editingFinished.connect(self._model_path_edited)
+        self.model_browse_button = QPushButton('찾기')
+        self.model_browse_button.setFixedSize(48, 24)
+        self.model_browse_button.clicked.connect(self._model_browse)
+        self.model_apply_button = QPushButton('적용')
+        self.model_apply_button.setFixedSize(48, 24)
+        self.model_apply_button.clicked.connect(lambda: self._model_apply(save=True))
+        model_row.addWidget(self.model_path_edit, 1)
+        model_row.addWidget(self.model_browse_button)
+        model_row.addWidget(self.model_apply_button)
+        compact_settings_layout.addLayout(model_row)
+
+        calib_edit_row = QHBoxLayout()
+        calib_edit_row.setSpacing(4)
+        edit_label = QLabel('수정값')
+        edit_label.setFixedWidth(54)
+        calib_edit_row.addWidget(edit_label)
+        self._calib_offset_spins = []
+        for axis in ('X', 'Y', 'Z'):
+            axis_label = QLabel(f'{axis}축')
+            axis_label.setFixedWidth(24)
+            calib_edit_row.addWidget(axis_label)
+            spin = QDoubleSpinBox()
+            spin.setRange(-300.0, 300.0)
+            spin.setDecimals(1)
+            spin.setSingleStep(1.0)
+            spin.setAlignment(Qt.AlignRight)
+            spin.setFixedSize(78, 24)
+            self._calib_offset_spins.append(spin)
+            calib_edit_row.addWidget(spin)
+        self.calib_load_button = QPushButton('불러오기')
+        self.calib_load_button.setFixedSize(62, 24)
+        self.calib_load_button.clicked.connect(self._calib_load)
+        self.calib_apply_button = QPushButton('적용')
+        self.calib_apply_button.setFixedSize(48, 24)
+        self.calib_apply_button.clicked.connect(self._calib_apply)
+        calib_edit_row.addStretch(1)
+        calib_edit_row.addWidget(self.calib_load_button)
+        calib_edit_row.addWidget(self.calib_apply_button)
+        compact_settings_layout.addLayout(calib_edit_row)
+
+        calib_current_row = QHBoxLayout()
+        calib_current_row.setSpacing(4)
+        current_label = QLabel('현재값')
+        current_label.setFixedWidth(54)
+        calib_current_row.addWidget(current_label)
+        self.calib_current_labels = {}
+        for axis in ('X', 'Y', 'Z'):
+            axis_label = QLabel(f'{axis}축')
+            axis_label.setFixedWidth(24)
+            value_label = QLabel('--.- mm')
+            value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            value_label.setFixedWidth(78)
+            value_label.setStyleSheet('color: #b0b0b0; font-family: monospace; font-size: 11px;')
+            self.calib_current_labels[axis] = value_label
+            calib_current_row.addWidget(axis_label)
+            calib_current_row.addWidget(value_label)
+        calib_current_row.addStretch(1)
+        compact_settings_layout.addLayout(calib_current_row)
+        left_box.addWidget(compact_settings_group)
 
         self.image_label = QLabel('카메라 영상 대기 중...')
         self.image_label.setAlignment(Qt.AlignCenter)
@@ -1061,8 +1150,189 @@ class PickPlaceGui(QWidget):
     def _safety_backdrive(self):
         self.ros_node.call_trigger_service(self.ros_node.cli_safety_backdrive, 'pick_place/safety_backdrive')
 
+    def _load_gui_settings(self) -> dict:
+        try:
+            if self._settings_path.is_file():
+                with open(self._settings_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            self.ros_node.get_logger().warn(f'GUI 설정 불러오기 실패: {e}')
+        return {}
+
+    def _save_gui_settings(self):
+        try:
+            self._settings_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._settings_path, 'w', encoding='utf-8') as f:
+                json.dump(self._settings, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.ros_node.get_logger().warn(f'GUI 설정 저장 실패: {e}')
+
+    _CALIB_OFFSET_PARAMS = [
+        'absolute_calib_x_mm',
+        'absolute_calib_y_mm',
+        'absolute_calib_z_mm',
+    ]
+
+    def _object_settings_param_names(self):
+        return self._CALIB_OFFSET_PARAMS + ['yolo_model']
+
+    def _maybe_load_object_settings(self):
+        now = time.monotonic()
+        if (
+            self._object_settings_loaded
+            or self._object_settings_loading
+            or now - self._last_object_settings_attempt < 1.0
+        ):
+            return
+        if not self.ros_node.cli_object_get_parameters.service_is_ready():
+            return
+        self._last_object_settings_attempt = now
+        self._calib_load()
+
+    def _maybe_apply_saved_model_path(self):
+        if self._saved_model_applied:
+            return
+        model_path = str(self._settings.get('yolo_model_path', '')).strip()
+        if not model_path or not self.ros_node.cli_object_set_parameters.service_is_ready():
+            return
+        self._saved_model_applied = True
+        self._model_apply(save=False, silent=True)
+
+    def _calib_load(self):
+        cli = self.ros_node.cli_object_get_parameters
+        if not cli.service_is_ready():
+            self.ros_node.get_logger().warn('object_detector get_parameters 서비스 미연결')
+            return
+        self._object_settings_loading = True
+        req = GetParameters.Request()
+        req.names = self._object_settings_param_names()
+        future = cli.call_async(req)
+        future.add_done_callback(self._on_calib_loaded)
+
+    def _on_calib_loaded(self, future):
+        try:
+            res = future.result()
+        except Exception as e:
+            self.ros_node.get_logger().error(f'캘리브레이션 불러오기 실패: {e}')
+            self._object_settings_loading = False
+            return
+        vals = [v.double_value for v in res.values[:3]]
+        for i, spin in enumerate(self._calib_offset_spins):
+            spin.blockSignals(True)
+            spin.setValue(vals[i])
+            spin.blockSignals(False)
+        self._calib_current_mm = vals
+        if len(res.values) >= 4:
+            model_path = res.values[3].string_value
+            if not self.model_path_edit.text().strip():
+                self.model_path_edit.setText(model_path)
+        self._object_settings_loaded = True
+        self._object_settings_loading = False
+        self._update_calib_current_label()
+        self.ros_node.get_logger().info('object_detector 설정 불러오기 완료')
+
+    def _calib_apply(self):
+        if self.ros_node.pick_place_state != 'IDLE':
+            self.ros_node.get_logger().warn('캘리브레이션 적용은 IDLE 상태에서만 가능합니다')
+            return
+        cli = self.ros_node.cli_object_set_parameters
+        if not cli.service_is_ready():
+            self.ros_node.get_logger().warn('object_detector set_parameters 서비스 미연결')
+            return
+        req = SetParameters.Request()
+        vals = [s.value() for s in self._calib_offset_spins]
+        for name, val in zip(self._CALIB_OFFSET_PARAMS, vals):
+            rp = RclParameter()
+            rp.name = name
+            rp.value = ParameterValue()
+            rp.value.type = ParameterType.PARAMETER_DOUBLE
+            rp.value.double_value = float(val)
+            req.parameters.append(rp)
+        future = cli.call_async(req)
+        future.add_done_callback(lambda f: self._on_calib_applied(f, vals))
+
+    def _on_calib_applied(self, future, vals):
+        try:
+            results = future.result().results
+            ok = bool(results) and all(result.successful for result in results)
+        except Exception as e:
+            self.ros_node.get_logger().error(f'캘리브레이션 적용 실패: {e}')
+            return
+        if ok:
+            self._calib_current_mm = list(vals)
+            self._update_calib_current_label()
+            self.ros_node.get_logger().info('캘리브레이션 적용 완료')
+        else:
+            reason = next((r.reason for r in results if not r.successful), '')
+            self.ros_node.get_logger().warn(f'캘리브레이션 적용 거절: {reason}')
+
+    def _update_calib_current_label(self):
+        vals = self._calib_current_mm
+        for axis, value in zip(('X', 'Y', 'Z'), vals):
+            text = '--.- mm' if value is None else f'{value:6.1f} mm'
+            self.calib_current_labels[axis].setText(text)
+
+    def _model_browse(self):
+        start = self.model_path_edit.text().strip() or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            'YOLO 모델 선택',
+            start,
+            'YOLO weights (*.pt);;All files (*)',
+        )
+        if path:
+            self.model_path_edit.setText(path)
+            self._model_path_edited()
+
+    def _model_path_edited(self):
+        path = self.model_path_edit.text().strip()
+        self._settings['yolo_model_path'] = path
+        self._save_gui_settings()
+
+    def _model_apply(self, save: bool, silent: bool = False):
+        path = self.model_path_edit.text().strip()
+        if not path:
+            if not silent:
+                self.ros_node.get_logger().warn('모델 경로가 비어 있습니다')
+            return
+        if save:
+            self._settings['yolo_model_path'] = path
+            self._save_gui_settings()
+        cli = self.ros_node.cli_object_set_parameters
+        if not cli.service_is_ready():
+            if not silent:
+                self.ros_node.get_logger().warn('object_detector set_parameters 서비스 미연결')
+            return
+        req = SetParameters.Request()
+        rp = RclParameter()
+        rp.name = 'yolo_model'
+        rp.value = ParameterValue()
+        rp.value.type = ParameterType.PARAMETER_STRING
+        rp.value.string_value = path
+        req.parameters.append(rp)
+        future = cli.call_async(req)
+        future.add_done_callback(lambda f: self._on_model_applied(f, path, silent))
+
+    def _on_model_applied(self, future, path: str, silent: bool):
+        try:
+            results = future.result().results
+            ok = bool(results) and all(result.successful for result in results)
+        except Exception as e:
+            self.ros_node.get_logger().error(f'모델 경로 적용 실패: {e}')
+            return
+        if ok:
+            if not silent:
+                self.ros_node.get_logger().info(f'모델 경로 적용 완료: {path}')
+        else:
+            reason = next((r.reason for r in results if not r.successful), '')
+            self.ros_node.get_logger().warn(f'모델 경로 적용 거절: {reason}')
+
     def _update_ui(self):
         self.ros_node.refresh_system_status()
+        self._maybe_load_object_settings()
+        self._maybe_apply_saved_model_path()
 
         # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
         if self.ros_node.latest_qimage is not None:
@@ -1110,6 +1380,14 @@ class PickPlaceGui(QWidget):
         self.gripper_close_button.setEnabled(command_enabled)
         self._update_manual_button_texts()
         self.auto_button.setEnabled(command_enabled and is_idle)
+        object_param_ready = (
+            self.ros_node.cli_object_get_parameters.service_is_ready()
+            and self.ros_node.cli_object_set_parameters.service_is_ready()
+        )
+        self.calib_load_button.setEnabled(self.ros_node.cli_object_get_parameters.service_is_ready())
+        self.calib_apply_button.setEnabled(object_param_ready and is_idle)
+        self.model_browse_button.setEnabled(True)
+        self.model_apply_button.setEnabled(self.ros_node.cli_object_set_parameters.service_is_ready())
 
         # ── 안전 모드 버튼 ────────────────────────────────────────────
         # 속도 모드: EMERGENCY_STOP이 아닐 때 전환 가능

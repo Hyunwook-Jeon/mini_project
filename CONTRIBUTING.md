@@ -33,6 +33,8 @@ python3 -m py_compile \
   dsr_realsense_pick_place/object_detector.py \
   dsr_realsense_pick_place/pick_place_node.py \
   launch/pick_place.launch.py
+
+python3 scripts/check_gui_integrity.py
 ```
 
 워크스페이스 루트에서는 아래도 함께 확인합니다.
@@ -65,4 +67,3 @@ colcon build --packages-select dsr_realsense_pick_place
 - `pick_place.launch.py`의 TF 값은 예시값일 수 있으니 함부로 공통 기본값을 바꾸지 않습니다.
 - 실제 로봇 IP, 카메라 시리얼, hand-eye calibration 값은 팀 합의 없이 하드코딩하지 않습니다.
 - 그리퍼 IO 번호 변경 시 README 또는 설정 파일 설명도 같이 수정합니다.
-

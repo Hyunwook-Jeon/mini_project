@@ -73,7 +73,7 @@ IDLE  (대기)
      ↓  run_once
 HOME  (홈 이동)
      ↓
-DETECTING  (/selected_object_pose 대기, 30초 타임아웃)
+DETECTING  (/selected_object_pose 대기, 10초 타임아웃)
      ↓
 PRE_PICK  (물체 위 안전 높이 이동 + 그리퍼 열기)
      ↓
@@ -218,9 +218,12 @@ ros2 launch dsr_realsense_pick_place pick_place.launch.py \
 | 인수 | 기본값 | 설명 |
 |---|---|---|
 | `mode` | `virtual` | `virtual` 또는 `real` |
-| `host` | `127.0.0.1` | 로봇 IP (real 모드) |
+| `host` | `110.120.1.50` | 로봇 IP (real 모드) |
 | `port` | `12345` | 로봇 통신 포트 |
 | `model` | `e0509` | Doosan 모델명 |
+| `color` | `white` | 로봇 색상 |
+| `robot_name` | `dsr01` | Doosan ROS namespace |
+| `robot_base_frame` | `base_link` | 로봇 기준 base frame |
 | `use_realsense` | `true` | RealSense 카메라 노드 실행 여부 |
 | `camera_serial` | `` | RealSense 시리얼 번호 (비어 있으면 자동) |
 | `cam_tf_x/y/z` | `0.5/0.0/0.6` | 카메라→베이스 TF 위치 (m) |
@@ -259,9 +262,9 @@ pick_place_node:
 ### Place 위치 설정
 
 ```yaml
-    place_position: [0.4, -0.3, 0.1]   # [x, y, z] (m), 로봇 베이스 기준
+    place_position: [0.4, -0.3, 0.2]   # [x, y, z] (m), 로봇 베이스 기준
     pre_place_z_offset: 0.15
-    place_rpy: [0.0, 180.0, 0.0]        # 수직 하강
+    place_rpy: [0.0, 179.9, 0.0]       # 수직 하강 (특이점 회피)
 ```
 
 ---
@@ -274,6 +277,8 @@ pick_place_node:
 4. **긴급 정지(E-STOP)** 버튼: 즉시 모션 중단 + 선택 라벨 해제.
 5. **태스크 중단** 버튼: 현재 모션 후 그리퍼 열고 HOME 복귀 + 선택 라벨 해제.
 6. **긴급정지 해제** 버튼: "⏳ 리셋 중..." 표시 후 하드웨어 알람 리셋 → IDLE 복귀.
+7. **수동 제어** 패널: HOME 이동, 그리퍼 OPEN/CLOSE를 수동으로 실행할 수 있다.
+8. **로봇 안전 모드** 패널: 정상 속도/감속 모드 전환, 서보 OFF/ON, 역구동(중력보상) 모드를 제어한다.
 
 ---
 
@@ -284,12 +289,15 @@ pick_place_node:
 | 토픽 | 타입 | 발행 노드 |
 |---|---|---|
 | `/selected_object_pose` | `PoseStamped` | object_detector |
+| `/detected_object_pose` | `PoseStamped` | object_detector |
 | `/detected_objects` | `String` (JSON) | object_detector |
 | `/detection_debug_image` | `Image` | object_detector |
 | `/pick_place_state` | `String` | pick_place_node |
 | `/robot_hw_state` | `Int32` | pick_place_node |
 | `/robot_speed_mode` | `Int32` | pick_place_node |
 | `/system/heartbeat` | `String` | pick_place_node |
+| `/dsr01/torque_rt_stream` | `TorqueRtStream` | pick_place_node |
+| `/gripper/state` | `JointState` | gripper_node |
 | `/selected_object_label` | `String` | gui_node |
 
 ### pick_place_node 서비스 (수신)
@@ -307,6 +315,15 @@ pick_place_node:
 | `/pick_place/servo_on` | 서보 ON |
 | `/pick_place/safety_normal` | 정상 운전 복귀 |
 | `/pick_place/safety_backdrive` | 역구동(중력보상) 모드 진입 |
+
+### gripper_node 서비스
+
+| 서비스 | 타입 | 설명 |
+|---|---|---|
+| `/gripper/open` | `Trigger` | 그리퍼 열기 |
+| `/gripper/close` | `Trigger` | 그리퍼 닫기 |
+| `/gripper/stop` | `Trigger` | 토크 OFF (비상 정지) |
+| `/gripper/enable` | `SetBool` | 토크 ON/OFF 제어 |
 
 ---
 

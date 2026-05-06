@@ -43,6 +43,7 @@ from cv_bridge import CvBridge, CvBridgeError
 import message_filters
 import tf2_ros
 import tf2_geometry_msgs  # noqa: F401  (transform 메서드 등록용)
+from rcl_interfaces.msg import SetParametersResult
 
 
 class ObjectDetectorNode(Node):
@@ -141,6 +142,7 @@ class ObjectDetectorNode(Node):
         self.model = None
         if self.use_yolo:
             self._load_yolo()
+        self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         # ── TF2 ─────────────────────────────────────────────────────────
         self.tf_buffer = tf2_ros.Buffer()
@@ -254,28 +256,87 @@ class ObjectDetectorNode(Node):
     # ────────────────────────────────────────────────────────────────────
     # YOLO 로드
     # ────────────────────────────────────────────────────────────────────
-    def _load_yolo(self):
+    def _load_yolo(self, model_name: str | None = None, keep_previous: bool = False):
 
-        model_name = str(self.get_parameter('yolo_model').value).strip()
+        model_name = str(model_name if model_name is not None else self.get_parameter('yolo_model').value).strip()
         model_name = self._resolve_model_name(model_name)
+        old_model = self.model
+        old_use_yolo = self.use_yolo
 
         try:
             from ultralytics import YOLO
             # model_name 이 파일 경로면 로컬 파일을, 문자열이면 기본 weight 이름을 읽는다.
             self.model = YOLO(model_name)
+            self.use_yolo = True
             self.get_logger().info(f'YOLO 모델 로드 완료: {model_name}')
+            return True
         except ImportError:
             self.get_logger().warn(
                 'ultralytics 패키지 없음 → 색상 기반 검출로 전환. '
                 '설치: pip install ultralytics'
             )
-            self.use_yolo = False
+            if keep_previous:
+                self.model = old_model
+                self.use_yolo = old_use_yolo
+            else:
+                self.use_yolo = False
+            return False
         except Exception as e:
             self.get_logger().warn(
                 f'YOLO 모델 로드 실패({model_name}): {e} '
                 '→ 색상 기반 검출로 전환'
             )
-            self.use_yolo = False
+            if keep_previous:
+                self.model = old_model
+                self.use_yolo = old_use_yolo
+            else:
+                self.use_yolo = False
+            return False
+
+    def _on_parameters_changed(self, params):
+        calib_updates = {}
+        model_update = None
+        for param in params:
+            if param.name in (
+                'absolute_calib_x_mm',
+                'absolute_calib_y_mm',
+                'absolute_calib_z_mm',
+            ):
+                try:
+                    calib_updates[param.name] = float(param.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f'{param.name}: 숫자 값이 필요합니다',
+                    )
+            elif param.name == 'yolo_model':
+                model_update = str(param.value).strip()
+
+        if model_update is not None:
+            if not model_update:
+                return SetParametersResult(successful=False, reason='yolo_model 경로가 비어 있습니다')
+            if not self._load_yolo(model_update, keep_previous=True):
+                return SetParametersResult(
+                    successful=False,
+                    reason='YOLO 모델 로드 실패. 기존 모델을 유지합니다',
+                )
+
+        if 'absolute_calib_x_mm' in calib_updates:
+            self.abs_calib_x_m = calib_updates['absolute_calib_x_mm'] / 1000.0
+        if 'absolute_calib_y_mm' in calib_updates:
+            self.abs_calib_y_m = calib_updates['absolute_calib_y_mm'] / 1000.0
+        if 'absolute_calib_z_mm' in calib_updates:
+            self.abs_calib_z_m = calib_updates['absolute_calib_z_mm'] / 1000.0
+
+        if calib_updates:
+            self.get_logger().info(
+                '수동 캘리브레이션 갱신: '
+                f'X={self.abs_calib_x_m * 1000.0:.1f}mm, '
+                f'Y={self.abs_calib_y_m * 1000.0:.1f}mm, '
+                f'Z={self.abs_calib_z_m * 1000.0:.1f}mm'
+            )
+
+        return SetParametersResult(successful=True)
 
     # ────────────────────────────────────────────────────────────────────
     # 콜백
