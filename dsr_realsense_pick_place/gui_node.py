@@ -34,6 +34,7 @@ Qt-ROS 이벤트 루프 통합:
 
 import os
 import json
+import signal
 import sys
 import math
 import time
@@ -2017,6 +2018,21 @@ class PickPlaceGui(QWidget):
         if self.ros_node.selected_label in labels:
             return f'선택 상태: {self.ros_node.selected_label} 검출됨'
         return f'선택 상태: {self.ros_node.selected_label} 대기 중'
+
+    def closeEvent(self, event):
+        """GUI 창이 닫힐 때 launch로 띄운 모든 노드를 함께 종료한다.
+
+        ros2 launch 는 별도 프로세스 그룹을 생성하지 않으므로,
+        부모 프로세스(launch runner)에 SIGTERM 을 전달해 전체 launch 그룹을 정리한다.
+        """
+        self.ros_node.get_logger().info('GUI 종료 감지 — 전체 launch 그룹 종료 요청')
+        event.accept()
+        # launch 프로세스(부모)에 SIGTERM → launch 가 모든 자식 노드를 정리한다
+        try:
+            ppid = os.getppid()
+            os.kill(ppid, signal.SIGTERM)
+        except Exception as e:
+            self.ros_node.get_logger().warn(f'launch 종료 신호 전달 실패: {e}')
 
 
 def main(args=None):

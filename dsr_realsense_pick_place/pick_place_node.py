@@ -366,8 +366,22 @@ class PickPlaceNode(Node):
             self._object_lost_debounce_count = 0
             return
 
-        # debounce: 연속 N프레임 조건 지속 시에만 낙하 판정
-        if pos > self.max_grip_pos or curr < self.object_lost_current_threshold:
+        # curr=0.0 은 그리퍼 Modbus 폴링 실패 시 나오는 stale 값이므로 낙하 판정에서 제외한다.
+        # 위치 단독 조건(OR)은 오탐이 많으므로 전류가 정상일 때는 발동하지 않도록
+        # 조건을 AND 로 변경한다: 그리퍼가 완전히 닫혀 있고(pos > max) 동시에 전류도 낮을 때만 낙하.
+        curr_stale = (curr == 0.0)
+        pos_lost   = (pos > self.max_grip_pos)
+        curr_lost  = (curr > 0.0 and curr < self.object_lost_current_threshold)
+
+        # 낙하로 판정하는 조건:
+        #   1) 전류가 threshold 미만 (stale 제외)
+        #   2) 그리퍼가 완전히 닫혀 있으면서 동시에 전류도 threshold 미만 (AND 조건)
+        object_lost_condition = curr_lost or (pos_lost and curr_lost)
+
+        if curr_stale:
+            # 폴링 실패 — debounce 카운터를 리셋하지 않고 유지(단, 카운트도 올리지 않음)
+            pass
+        elif object_lost_condition:
             self._object_lost_debounce_count += 1
             if self._object_lost_debounce_count >= self.object_lost_debounce_frames:
                 self.get_logger().error(
