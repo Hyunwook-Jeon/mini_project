@@ -51,8 +51,6 @@ ARGUMENTS = [
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
     DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
                           description='컨트롤러 DRL 그리퍼 TCP 서버 포트'),
-    DeclareLaunchArgument('pre_cleanup', default_value='false',
-                          description='launch 전 좀비 프로세스 자동 정리 여부 (true | false)'),
 ]
 
 
@@ -60,17 +58,6 @@ def generate_launch_description():
 
     pkg_this = get_package_share_directory('dsr_realsense_pick_place')
     params_file = os.path.join(pkg_this, 'config', 'pick_place_params.yaml')
-
-    # launch 전 좀비 프로세스 정리 (pre_cleanup:=true 일 때만 실행)
-    cleanup_script = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        'scripts', 'cleanup.sh'
-    )
-    pre_cleanup = ExecuteProcess(
-        cmd=['bash', cleanup_script],
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('pre_cleanup')),
-    )
 
     doosan_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
@@ -210,7 +197,6 @@ def generate_launch_description():
     )
 
     return LaunchDescription(ARGUMENTS + [
-        pre_cleanup,
         doosan_bringup,
         set_robot_mode,
         realsense_node,

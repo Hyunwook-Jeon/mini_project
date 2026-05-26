@@ -28,6 +28,7 @@ setup(
         # launch, config 파일도 설치본에서 바로 찾을 수 있도록 함께 복사한다.
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'scripts'), glob('scripts/*.sh')),
     ],
     install_requires=[
         'setuptools',

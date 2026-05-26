@@ -34,7 +34,7 @@ Qt-ROS 이벤트 루프 통합:
 
 import os
 import json
-import signal
+import subprocess
 import sys
 import math
 import time
@@ -766,6 +766,10 @@ class PickPlaceGui(QWidget):
         self._object_settings_loading = False
         self._saved_model_applied = False
         self._last_object_settings_attempt = 0.0
+        self._system_reset_proc = None   # shutdown_nodes.sh 프로세스
+        self._system_restart_proc = None # 재시작 launch 프로세스
+        self._system_reset_phase = ''    # '' | 'shutting_down' | 'waiting' | 'restarting'
+        self._system_reset_phase_until = 0.0
 
         # 좌측은 카메라 영상, 우측은 상태/선택 패널로 나누어 배치한다.
         self.setWindowTitle('DSR RealSense Pick & Place GUI')
@@ -1198,6 +1202,33 @@ class PickPlaceGui(QWidget):
         safety_mode_row.addWidget(self.safety_backdrive_button)
         safety_layout.addLayout(safety_mode_row)
 
+        # 시스템 리셋 버튼 (GUI 제외 전체 노드 재시작)
+        reset_divider = QFrame()
+        reset_divider.setFrameShape(QFrame.HLine)
+        reset_divider.setFrameShadow(QFrame.Sunken)
+        reset_divider.setStyleSheet('background-color: #444;')
+        safety_layout.addWidget(reset_divider)
+
+        self.system_reset_button = QPushButton('🔄  시스템 리셋 (GUI 유지)')
+        self.system_reset_button.setMinimumHeight(36)
+        self.system_reset_button.setToolTip(
+            'GUI를 제외한 모든 노드를 정상 종료 후 재시작합니다.\n'
+            'DRCF 연결이 정상 해제되어 joint가 즉시 활성화됩니다.'
+        )
+        self.system_reset_button.setStyleSheet(
+            'QPushButton { background-color: #4a3000; color: white;'
+            '  font-weight: bold; border-radius: 5px; }'
+            'QPushButton:hover { background-color: #7a5000; }'
+            'QPushButton:disabled { background-color: #444; color: #888; }'
+        )
+        self.system_reset_button.clicked.connect(self._system_reset)
+        safety_layout.addWidget(self.system_reset_button)
+
+        self.system_reset_label = QLabel('')
+        self.system_reset_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        self.system_reset_label.setAlignment(Qt.AlignCenter)
+        safety_layout.addWidget(self.system_reset_label)
+
         object_group = QGroupBox('검출된 물체 선택')
         object_layout = QVBoxLayout(object_group)
         self.auto_button = QPushButton('자동 선택 사용')
@@ -1470,6 +1501,35 @@ class PickPlaceGui(QWidget):
     def _safety_backdrive(self):
         self.ros_node.call_trigger_service(self.ros_node.cli_safety_backdrive, 'pick_place/safety_backdrive')
 
+    def _system_reset(self):
+        """GUI를 제외한 모든 노드를 정상 종료 후 재시작한다.
+
+        shutdown_nodes.sh → DRCF 해제 대기 → ros2 launch (gui:=false) 순서로 진행.
+        subprocess 완료 여부는 _update_ui에서 QTimer로 폴링한다.
+        """
+        from ament_index_python.packages import get_package_share_directory
+
+        if self._system_reset_phase:
+            return  # 이미 진행 중
+
+        self.system_reset_button.setEnabled(False)
+        self.system_reset_label.setText('⏳ 노드 종료 중...')
+        self._system_reset_phase = 'shutting_down'
+
+        try:
+            pkg_share = get_package_share_directory('dsr_realsense_pick_place')
+            shutdown_script = os.path.join(pkg_share, 'scripts', 'shutdown_nodes.sh')
+            self._system_reset_proc = subprocess.Popen(
+                ['bash', shutdown_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            self.ros_node.get_logger().error(f'시스템 리셋 실패: {e}')
+            self.system_reset_label.setText(f'❌ 실패: {e}')
+            self._system_reset_phase = ''
+            self.system_reset_button.setEnabled(True)
+
     def _load_gui_settings(self) -> dict:
         try:
             if self._settings_path.is_file():
@@ -1649,10 +1709,48 @@ class PickPlaceGui(QWidget):
             reason = next((r.reason for r in results if not r.successful), '')
             self.ros_node.get_logger().warn(f'모델 경로 적용 거절: {reason}')
 
+    def _poll_system_reset(self):
+        """시스템 리셋 진행 상태를 100ms 주기로 확인하고 단계별 처리를 수행한다."""
+        if not self._system_reset_phase:
+            return
+
+        if self._system_reset_phase == 'shutting_down':
+            if self._system_reset_proc and self._system_reset_proc.poll() is not None:
+                # shutdown 완료 → launch 재시작
+                self.system_reset_label.setText('🚀 노드 재시작 중...')
+                self._system_reset_phase = 'restarting'
+                try:
+                    self._system_restart_proc = subprocess.Popen(
+                        [
+                            'ros2', 'launch',
+                            'dsr_realsense_pick_place', 'pick_place.launch.py',
+                            'mode:=real',
+                            'host:=110.120.1.50',
+                            'gui:=false',
+                            'pre_cleanup:=false',
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    self.ros_node.get_logger().error(f'재시작 실패: {e}')
+                    self.system_reset_label.setText(f'❌ 재시작 실패: {e}')
+                    self._system_reset_phase = ''
+                    self.system_reset_button.setEnabled(True)
+
+        elif self._system_reset_phase == 'restarting':
+            # launch 프로세스는 계속 실행 중이 정상 — 10초 후 완료로 간주
+            if self._system_reset_phase_until == 0.0:
+                self._system_reset_phase_until = time.monotonic() + 10.0
+            if time.monotonic() >= self._system_reset_phase_until:
+                self.system_reset_label.setText('✅ 재시작 시작됨 (노드 기동 중...)')
+                self._system_reset_phase = ''
+                self._system_reset_phase_until = 0.0
+                self.system_reset_button.setEnabled(True)
+
     def _update_ui(self):
-        # 그리퍼 파라미터 적용 버튼: 콜백 완료 후 Qt 스레드에서 안전하게 복원
-        if not getattr(self, '_gripper_apply_busy', False):
-            self.gripper_apply_button.setEnabled(True)
+        # 시스템 리셋 진행 상태 폴링
+        self._poll_system_reset()
 
         self.ros_node.refresh_system_status()
         self._maybe_load_object_settings()
@@ -1685,27 +1783,60 @@ class PickPlaceGui(QWidget):
                 self._reset_in_progress = False
         self._update_manual_command_feedback(state)
 
+        # ── 서비스 / 하드웨어 연결 상태 (100ms 폴링) ─────────────────
+        go_home_svc       = self.ros_node.cli_go_home.service_is_ready()
+        recover_svc       = self.ros_node.cli_recover_to_home.service_is_ready()
+        gripper_open_svc  = self.ros_node.cli_gripper_open.service_is_ready()
+        gripper_close_svc = self.ros_node.cli_gripper_close.service_is_ready()
+        pick_svc          = self.ros_node.cli_run_once.service_is_ready()
+        speed_normal_svc  = self.ros_node.cli_speed_normal.service_is_ready()
+        speed_reduced_svc = self.ros_node.cli_speed_reduced.service_is_ready()
+        servo_off_svc     = self.ros_node.cli_servo_off.service_is_ready()
+        servo_on_svc      = self.ros_node.cli_servo_on.service_is_ready()
+        safety_normal_svc = self.ros_node.cli_safety_normal.service_is_ready()
+        safety_bd_svc     = self.ros_node.cli_safety_backdrive.service_is_ready()
+        e_stop_reset_svc  = self.ros_node.cli_e_stop_reset.service_is_ready()
+        gripper_param_svc = self.ros_node.cli_gripper_set_parameters.service_is_ready()
+
+        gripper_hw_ready  = self.ros_node.gripper_hw_ready
+        # hw=-1: 미수신, 6: E-STOP, 15: NOT_READY → 이 세 상태에서는 수동 명령 불가
+        hw_ok             = hw not in (-1, 6, 15)
+
         # ── 긴급 제어 버튼 ────────────────────────────────────────────
-        self.e_stop_button.setEnabled(not is_e_stopped)
+        # E-STOP: 항상 활성 (서비스 미연결이어도 클릭 가능해야 하는 최우선 안전 버튼)
+        self.e_stop_button.setEnabled(True)
         self.cancel_button.setEnabled(is_active)
         if self._reset_in_progress:
             self.e_stop_reset_button.setEnabled(False)
             self.e_stop_reset_button.setText('리셋 중...')
         else:
             self.e_stop_reset_button.setText('긴급정지 해제')
-            self.e_stop_reset_button.setEnabled(is_e_stopped)
+            # 긴급정지 해제: E-STOP 상태 + 서비스 연결 시에만 활성
+            self.e_stop_reset_button.setEnabled(is_e_stopped and e_stop_reset_svc)
 
         # ── 수동 제어 버튼 ────────────────────────────────────────────
-        manual_enabled = state in ('IDLE', 'DETECTING', 'ERROR') and not self._reset_in_progress and hw not in (6, 15)
-        manual_busy = self._manual_command is not None
+        # HW 준비 + 비정상 상태가 아닐 때 + 리셋 중이 아닐 때
+        manual_enabled = (
+            state in ('IDLE', 'DETECTING', 'ERROR')
+            and not self._reset_in_progress
+            and hw_ok
+        )
+        manual_busy     = self._manual_command is not None
         command_enabled = manual_enabled and not manual_busy
-        object_buttons_enabled = command_enabled and is_idle
-        self.home_button.setEnabled(command_enabled)
-        self.gripper_open_button.setEnabled(command_enabled)
-        self.gripper_close_button.setEnabled(command_enabled)
-        self.recover_home_button.setEnabled(command_enabled)
+
+        # HOME: pick_place 서비스 연결 필요
+        self.home_button.setEnabled(command_enabled and go_home_svc)
+        # 에러 복구 & HOME: recover 서비스 연결 필요
+        self.recover_home_button.setEnabled(command_enabled and recover_svc)
+        # 그리퍼 수동 조작: 그리퍼 HW 초기화 완료(INITIALIZE) + 각 서비스 연결 필요
+        gripper_cmd_ok = command_enabled and gripper_hw_ready
+        self.gripper_open_button.setEnabled(gripper_cmd_ok and gripper_open_svc)
+        self.gripper_close_button.setEnabled(gripper_cmd_ok and gripper_close_svc)
         self._update_manual_button_texts()
-        self.auto_button.setEnabled(command_enabled and is_idle)
+        # 물체 선택 / 자동 선택: IDLE + 모든 서비스 준비 + 그리퍼 HW 완료 필요
+        full_system_ready  = command_enabled and is_idle and pick_svc and gripper_hw_ready
+        object_buttons_enabled = full_system_ready
+        self.auto_button.setEnabled(full_system_ready)
         object_param_ready = (
             self.ros_node.cli_object_get_parameters.service_is_ready()
             and self.ros_node.cli_object_set_parameters.service_is_ready()
@@ -1739,9 +1870,16 @@ class PickPlaceGui(QWidget):
             )
             
         # 그리퍼 파라미터 적용 버튼 및 컨트롤들 활성화 제어
-        gripper_param_ready = self.ros_node.cli_gripper_set_parameters.service_is_ready()
-        self.gripper_apply_button.setEnabled(gripper_param_ready and command_enabled)
-        
+        # 적용: 서비스 연결 + 그리퍼 HW 초기화 완료 + 명령 가능 + 이전 요청 완료
+        gripper_apply_ok = (
+            gripper_param_svc
+            and gripper_hw_ready
+            and command_enabled
+            and not getattr(self, '_gripper_apply_busy', False)
+        )
+        self.gripper_apply_button.setEnabled(gripper_apply_ok)
+
+        # 슬라이더/스핀박스: 값 편집은 command_enabled 시 허용 (서비스 없어도 편집 가능)
         self.close_curr_slider.setEnabled(command_enabled)
         self.close_curr_spin.setEnabled(command_enabled)
         self.open_curr_slider.setEnabled(command_enabled)
@@ -1752,13 +1890,13 @@ class PickPlaceGui(QWidget):
         self.acc_spin.setEnabled(command_enabled)
 
         # ── 안전 모드 버튼 ────────────────────────────────────────────
-        # 속도 모드: EMERGENCY_STOP이 아닐 때 전환 가능
-        self.speed_normal_button.setEnabled(not is_e_stopped)
-        self.speed_reduced_button.setEnabled(not is_e_stopped)
-        # 서보 OFF: EMERGENCY_STOP 아닐 때 / 서보 ON: HW 상태가 SAFE_OFF(3,10)일 때
+        # 속도 모드: E-STOP이 아닐 때 + 서비스 연결 필요
+        self.speed_normal_button.setEnabled(not is_e_stopped and speed_normal_svc)
+        self.speed_reduced_button.setEnabled(not is_e_stopped and speed_reduced_svc)
+        # 서보 OFF: E-STOP 아닐 때 + 서비스 연결 / 서보 ON: SAFE_OFF(3,10) 또는 E-STOP + 서비스 연결
         is_safe_off = hw in (3, 10)   # STATE_SAFE_OFF, STATE_SAFE_OFF2
-        self.servo_off_button.setEnabled(not is_e_stopped)
-        self.servo_on_button.setEnabled(is_safe_off or is_e_stopped)
+        self.servo_off_button.setEnabled(not is_e_stopped and servo_off_svc)
+        self.servo_on_button.setEnabled((is_safe_off or is_e_stopped) and servo_on_svc)
 
         # ── HW 상태 레이블 ────────────────────────────────────────────
         hw_state_names = {
@@ -1789,10 +1927,12 @@ class PickPlaceGui(QWidget):
             f'background-color: {speed_color}; color: white;'
         )
 
-        # ── Doosan 안전 모드 버튼 — 항상 활성 (역구동/비상정지 해제 수단이므로) ──
+        # ── Doosan 안전 모드 버튼 ────────────────────────────────────
+        # 정상 운전: 서비스 연결 시 활성 (역구동 해제 수단이므로 비교적 관대)
+        # 역구동: 이미 역구동 중이 아닐 때 + 서비스 연결
         is_backdrive = state == 'BACKDRIVE'
-        self.safety_auto_button.setEnabled(True)
-        self.safety_backdrive_button.setEnabled(not is_backdrive)
+        self.safety_auto_button.setEnabled(safety_normal_svc)
+        self.safety_backdrive_button.setEnabled(not is_backdrive and safety_bd_svc)
 
         # 역구동 중 라벨 업데이트
         if is_backdrive:
@@ -2019,20 +2159,6 @@ class PickPlaceGui(QWidget):
             return f'선택 상태: {self.ros_node.selected_label} 검출됨'
         return f'선택 상태: {self.ros_node.selected_label} 대기 중'
 
-    def closeEvent(self, event):
-        """GUI 창이 닫힐 때 launch로 띄운 모든 노드를 함께 종료한다.
-
-        ros2 launch 는 별도 프로세스 그룹을 생성하지 않으므로,
-        부모 프로세스(launch runner)에 SIGTERM 을 전달해 전체 launch 그룹을 정리한다.
-        """
-        self.ros_node.get_logger().info('GUI 종료 감지 — 전체 launch 그룹 종료 요청')
-        event.accept()
-        # launch 프로세스(부모)에 SIGTERM → launch 가 모든 자식 노드를 정리한다
-        try:
-            ppid = os.getppid()
-            os.kill(ppid, signal.SIGTERM)
-        except Exception as e:
-            self.ros_node.get_logger().warn(f'launch 종료 신호 전달 실패: {e}')
 
 
 def main(args=None):
