@@ -135,6 +135,9 @@ class ObjectDetectorNode(Node):
         self.selected_object_label = ''
         self.last_logged_selected_label = None
 
+        # pick_place 상태 구독 — LIFT/MOVE_TO_PLACE 중에는 "검출되지 않음" WARN을 억제한다.
+        self._pick_place_state = ''
+
         # RealSense SDK의 deproject 함수를 쓰기 위해 rs.intrinsics 객체를 저장한다.
         self.intrinsics = None
 
@@ -186,6 +189,8 @@ class ObjectDetectorNode(Node):
         self.ts.registerCallback(self._cb_synced_camera)
         self.create_subscription(String, p('selected_object_topic').value,
                                  self._cb_selected_object, 10)
+        self.create_subscription(String, '/pick_place_state',
+                                 self._cb_pick_place_state, 10)
 
         # ── 발행 ────────────────────────────────────────────────────────
         self.pub_pose = self.create_publisher(PoseStamped,
@@ -241,7 +246,10 @@ class ObjectDetectorNode(Node):
 
         matches: list[Path] = []
         for root in self._candidate_search_roots():
-            matches.extend(p for p in root.rglob(model_path.name) if p.is_file())
+            try:
+                matches.extend(p for p in root.rglob(model_path.name) if p.is_file())
+            except OSError:
+                pass
 
         if matches:
             if len(matches) > 1:
@@ -384,6 +392,9 @@ class ObjectDetectorNode(Node):
             label_text = self.selected_object_label if self.selected_object_label else '자동 선택'
             self.get_logger().info(f'선택 물체 변경: {label_text}')
             self.last_logged_selected_label = self.selected_object_label
+
+    def _cb_pick_place_state(self, msg: String):
+        self._pick_place_state = msg.data.strip()
 
     # ────────────────────────────────────────────────────────────────────
     # 메인 검출 루프
@@ -754,10 +765,14 @@ class ObjectDetectorNode(Node):
             ]
         if not filtered:
             if self.selected_object_label:
-                self.get_logger().warn(
-                    f'선택한 물체({self.selected_object_label})가 현재 화면에서 검출되지 않음',
-                    throttle_duration_sec=2.0
-                )
+                # LIFT / MOVE_TO_PLACE 중에는 물체가 카메라에서 사라지는 것이 정상이므로
+                # 불필요한 WARN 폭격을 억제한다.
+                _suppress_states = {'LIFT', 'MOVE_TO_PLACE'}
+                if self._pick_place_state not in _suppress_states:
+                    self.get_logger().warn(
+                        f'선택한 물체({self.selected_object_label})가 현재 화면에서 검출되지 않음',
+                        throttle_duration_sec=2.0
+                    )
             return None
         return min(filtered, key=lambda item: item['depth_m'])
 

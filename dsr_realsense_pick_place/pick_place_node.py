@@ -1,3 +1,4 @@
+# 로봇 상태 머신 제어 및 이송 중 낙하 비상정지를 수행하는 제어 노드
 """
 pick_place_node.py
 ------------------
@@ -28,6 +29,7 @@ from enum import Enum, auto
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32, String
 from std_srvs.srv import Trigger
 
@@ -44,7 +46,7 @@ from dsr_msgs2.msg import TorqueRtStream
 
 class _MotionInterrupt(Exception):
     """긴급정지 또는 태스크 취소 요청 시 _call_service 내부에서 발생시키는 예외."""
-    def __init__(self, mode: str):  # 'e_stop' | 'cancel'
+    def __init__(self, mode: str):  # 'e_stop' | 'cancel' | 'object_lost'
         super().__init__(mode)
         self.mode = mode
 
@@ -113,6 +115,10 @@ class PickPlaceNode(Node):
         self.declare_parameter('selected_object_topic',       '/selected_object_label')
         self.declare_parameter('use_target_pose_yaw',         True)
         self.declare_parameter('grasp_yaw_offset_deg',        0.0)
+        self.declare_parameter('max_grip_pos',                700)
+        self.declare_parameter('object_lost_current_threshold', 20)
+        # 낙하 감지 debounce: 연속 N프레임 조건 지속 시에만 낙하 판정
+        self.declare_parameter('object_lost_debounce_frames',  5)
 
         ns = self.get_parameter('robot_namespace').value
         self.jvel         = self.get_parameter('joint_vel').value
@@ -130,6 +136,11 @@ class PickPlaceNode(Node):
         self.robot_base_frame = self.get_parameter('robot_base_frame').value
         self.use_target_pose_yaw = self.get_parameter('use_target_pose_yaw').value
         self.grasp_yaw_offset_deg = self.get_parameter('grasp_yaw_offset_deg').value
+        self.max_grip_pos = self.get_parameter('max_grip_pos').value
+        self.object_lost_current_threshold = self.get_parameter(
+            'object_lost_current_threshold').value
+        self.object_lost_debounce_frames = self.get_parameter(
+            'object_lost_debounce_frames').value
         self.ws = {
             'x': (self.get_parameter('workspace_x_min').value,
                   self.get_parameter('workspace_x_max').value),
@@ -171,7 +182,7 @@ class PickPlaceNode(Node):
         # 긴급정지 / 태스크 취소용 이벤트
         # _stop_event가 set되면 _call_service가 즉시 _MotionInterrupt를 발생시킨다.
         self._stop_event = threading.Event()
-        self._stop_mode  = 'e_stop'  # 'e_stop' | 'cancel'
+        self._stop_mode  = 'e_stop'  # 'e_stop' | 'cancel' | 'object_lost'
         self._missing_startup_services: set[str] = set()
         self._robot_mode_auto_ready = False
         self._robot_mode_requesting = False
@@ -179,6 +190,8 @@ class PickPlaceNode(Node):
         # 하드웨어 상태 캐시 (GUI 표시용)
         self._hw_state_cache: int = -1   # -1 = unknown
         self._speed_mode_cache: int = 0  # 0 = NORMAL
+        self._object_lost_triggered = False
+        self._object_lost_debounce_count = 0  # 낙하 조건 연속 프레임 카운터
         # 역구동(중력보상) 제어 스레드
         self._backdrive_active  = threading.Event()
         self._backdrive_thread: threading.Thread | None = None
@@ -199,6 +212,7 @@ class PickPlaceNode(Node):
             PoseStamped,
             self.get_parameter('target_pose_topic').value,
             self._cb_pose, 10)
+        self.create_subscription(JointState, '/gripper/state', self._cb_gripper_state, 10)
         self.create_service(Trigger, '/pick_place/run_once',       self._srv_run_once)
         self.create_service(Trigger, '/pick_place/go_home',        self._srv_go_home)
         self.create_service(Trigger, '/pick_place/e_stop',         self._srv_e_stop)
@@ -210,6 +224,7 @@ class PickPlaceNode(Node):
         self.create_service(Trigger, '/pick_place/servo_on',        self._srv_servo_on)
         self.create_service(Trigger, '/pick_place/safety_normal',   self._srv_safety_normal)
         self.create_service(Trigger, '/pick_place/safety_backdrive', self._srv_safety_backdrive)
+        self.create_service(Trigger, '/pick_place/recover_to_home',  self._srv_recover_to_home)
 
         # 1초마다 하드웨어 상태 폴링 → GUI 토픽으로 발행
         self.create_timer(1.0, self._poll_hw_state)
@@ -332,6 +347,58 @@ class PickPlaceNode(Node):
                     self.get_logger().warn(
                         f'작업 공간 밖 무시: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}')
 
+    def _cb_gripper_state(self, msg: JointState):
+        if 'gripper_joint' not in msg.name:
+            return
+
+        idx = msg.name.index('gripper_joint')
+        if idx >= len(msg.position) or idx >= len(msg.effort):
+            return
+
+        pos = float(msg.position[idx])
+        curr = float(msg.effort[idx])
+
+        with self.state_lock:
+            current_state = self.state
+            already_triggered = self._object_lost_triggered
+
+        if already_triggered or current_state not in (State.LIFT, State.MOVE_TO_PLACE):
+            self._object_lost_debounce_count = 0
+            return
+
+        # debounce: 연속 N프레임 조건 지속 시에만 낙하 판정
+        if pos > self.max_grip_pos or curr < self.object_lost_current_threshold:
+            self._object_lost_debounce_count += 1
+            if self._object_lost_debounce_count >= self.object_lost_debounce_frames:
+                self.get_logger().error(
+                    f'물체 탈조 낙하 감지 ({self._object_lost_debounce_count}프레임 지속):'
+                    f' 위치={pos:.1f}, 전류={curr:.1f}mA')
+                self._object_lost_debounce_count = 0
+                self._trigger_object_lost_stop()
+        else:
+            self._object_lost_debounce_count = 0
+
+    def _trigger_object_lost_stop(self):
+        with self.state_lock:
+            if self._object_lost_triggered:
+                return
+            self._object_lost_triggered = True
+            self._stop_mode = 'object_lost'
+            self.pick_requested = False
+            self.pending_command = None
+            self.target_pose = None
+
+        if self.cli_move_stop.service_is_ready():
+            req = MoveStop.Request()
+            req.stop_mode = 1  # QUICK_STOP
+            self.cli_move_stop.call_async(req)
+        else:
+            self.get_logger().warn('move_stop 서비스 미연결. 인터럽트로만 모션을 중단합니다.')
+
+        self._clear_selected_label()
+        self._stop_event.set()
+        self.get_logger().warn('낙하 감지: 모션 중단 후 태스크를 취소하고 홈으로 복귀합니다.')
+
     def _in_workspace(self, x, y, z) -> bool:
         """작업 가능 영역 검증. 영역 밖 좌표는 안전을 위해 무시."""
         return (self.ws['x'][0] <= x <= self.ws['x'][1] and
@@ -382,6 +449,9 @@ class PickPlaceNode(Node):
                     self._stop_event.clear()
                     if mi.mode == 'e_stop':
                         self._set_state(State.EMERGENCY_STOP)
+                    elif mi.mode == 'object_lost':
+                        self.get_logger().warn('낙하 감지: 태스크를 취소하고 홈으로 복귀합니다.')
+                        self._finish_cycle()
                     else:
                         self._finish_cycle()
                 except Exception as e:
@@ -490,6 +560,14 @@ class PickPlaceNode(Node):
                     except Exception as e2:
                         self.get_logger().warn(f'하드웨어 정지 실패 (무시): {e2}')
                     self._set_state(State.EMERGENCY_STOP)
+                elif mi.mode == 'object_lost':
+                    self.get_logger().warn('낙하 감지: 태스크를 취소하고 홈으로 복귀합니다.')
+                    try:
+                        self._gripper_open()
+                        self._go_home()
+                    except Exception as e2:
+                        self.get_logger().warn(f'낙하 복구 중 오류 (무시): {e2}')
+                    self._finish_cycle()
                 elif mi.mode == 'backdrive':
                     self.get_logger().info('역구동 전환: 진행 중 모션 중단 완료')
                     self._set_state(State.BACKDRIVE)
@@ -531,6 +609,7 @@ class PickPlaceNode(Node):
             if not self._ensure_robot_mode_auto_ready(timeout=5.0):
                 raise RuntimeError('robot_mode=AUTO 준비 전입니다. 잠시 후 다시 시도하세요.')
             self._clear_target()
+            self._object_lost_triggered = False
             self.pick_requested = True
             self._set_state(State.HOME)
             self._go_home()
@@ -545,6 +624,7 @@ class PickPlaceNode(Node):
             self._clear_selected_label()
             self._set_state(State.HOME)
             self._go_home()
+            self._object_lost_triggered = False
             self._set_state(State.IDLE)
             return
 
@@ -565,6 +645,7 @@ class PickPlaceNode(Node):
 
     def _finish_cycle(self):
         self.pick_requested = False
+        self._object_lost_triggered = False
         self._clear_target()
         self._clear_selected_label()
         self._set_state(State.IDLE)
@@ -643,6 +724,7 @@ class PickPlaceNode(Node):
             self.pending_command = None
             self.pick_requested = False
             self.target_pose = None
+            self._object_lost_triggered = False
 
         if self.cli_set_robot_ctrl.service_is_ready():
             req = SetRobotControl.Request()
@@ -783,6 +865,54 @@ class PickPlaceNode(Node):
 
         res.success = True
         res.message = '역구동 시작. 중력보상 토크 스트리밍 중. 정상운전 버튼으로 해제하세요.'
+        return res
+
+    def _srv_recover_to_home(self, _, res: Trigger.Response):
+        with self.state_lock:
+            if self.state != State.ERROR:
+                res.success = False
+                res.message = "로봇이 에러 상태가 아닙니다."
+                return res
+
+        try:
+            self.get_logger().info("에러 복구 및 안전 복귀 시퀀스를 시작합니다.")
+
+            # 1. 컨트롤러 에러 해제 및 상태 IDLE 복구
+            self._srv_e_stop_reset(None, Trigger.Response())
+            time.sleep(1.0)  # 알람 리셋 비동기 완료 대기
+
+            # 2. 서보 ON 제어권 복구 (실패해도 홈 이동은 시도)
+            try:
+                ctrl_req = SetRobotControl.Request()
+                ctrl_req.robot_control = 3  # CONTROL_SERVO_ON
+                self._call_service(self.cli_set_robot_ctrl, ctrl_req, "set_robot_control",
+                                   timeout=5.0)
+            except Exception as e:
+                self.get_logger().warn(f'서보 ON 요청 실패 (계속 진행): {e}')
+
+            # 3. 그리퍼 완전 Open
+            try:
+                self._gripper_open()
+            except Exception as e:
+                self.get_logger().warn(f'그리퍼 열기 실패 (계속 진행): {e}')
+
+            # 4. 홈 위치로 안전 복귀 이동
+            self._go_home()
+
+            # 5. 상태 초기화
+            with self.state_lock:
+                self._object_lost_triggered = False
+                self._object_lost_debounce_count = 0
+                self.state = State.IDLE
+
+            res.success = True
+            res.message = "에러 복구 및 홈으로 복귀 성공 완료"
+        except Exception as e:
+            self.get_logger().error(f'recover_to_home 실패: {e}')
+            with self.state_lock:
+                self.state = State.ERROR
+            res.success = False
+            res.message = f"복구 실패: {e}"
         return res
 
     def _backdrive_loop(self):

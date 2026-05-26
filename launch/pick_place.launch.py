@@ -1,6 +1,4 @@
-"""
-pick_place.launch.py
-"""
+# RealSense Pick & Place 전체 노드와 그리퍼 TCP 브릿지를 실행하는 launch 파일
 
 import os
 
@@ -51,6 +49,8 @@ ARGUMENTS = [
                           description='PyQt GUI 실행 여부'),
     DeclareLaunchArgument('use_launch_set_robot_mode', default_value='false',
                           description='Fallback: launch에서 set_robot_mode service call 실행 여부'),
+    DeclareLaunchArgument('gripper_tcp_port', default_value='20002',
+                          description='컨트롤러 DRL 그리퍼 TCP 서버 포트'),
 ]
 
 
@@ -148,6 +148,26 @@ def generate_launch_description():
     gripper = TimerAction(
         period=10.0,
         actions=[
+            Node(
+                package='dsr_gripper_tcp',
+                executable='gripper_service_node',
+                name='gripper_service',
+                output='screen',
+                parameters=[{
+                    'controller_host': LaunchConfiguration('host'),
+                    'tcp_port': LaunchConfiguration('gripper_tcp_port'),
+                    'namespace': LaunchConfiguration('robot_name'),
+                    'goal_current': 400,
+                    'profile_velocity': 1500,
+                    'profile_acceleration': 1000,
+                    'connect_timeout_sec': 60.0,
+                    'post_drl_start_sleep_sec': 2.0,
+                    'drl_idle_stable_sec': 2.0,
+                    'tcp_server_open_retry_sec': 0.5,
+                    'init_attempts': 15,
+                    'init_retry_delay_sec': 5.0,
+                }]
+            ),
             Node(
                 package='dsr_realsense_pick_place',
                 executable='gripper_node',

@@ -355,6 +355,46 @@ ros2 run rqt_image_view rqt_image_view /detection_debug_image
 
 ---
 
+## 변경 이력
+
+### feat/stability-ux-improvements
+
+#### 1. 낙하 감지 동작 변경 — EMO 제거, 자동 태스크 취소 + 홈 복귀
+- 기존: 물체 낙하 감지 시 `EMERGENCY_STOP` 상태로 전이 → 수동 해제 필요
+- 변경: 낙하 감지 시 모션 즉시 중단 → 그리퍼 열기 → 홈 복귀 → `IDLE` 자동 복귀
+- `object_lost_current_threshold` 기본값 80 → 20 mA (position-hold 모드 오탐 방지)
+- `object_lost_debounce_frames=5` 추가 — 연속 5프레임 조건 유지 시에만 낙하 판정
+
+#### 2. 에러 복구 서비스 추가 (`/pick_place/recover_to_home`)
+- `EMERGENCY_STOP` / `ERROR` 상태에서 알람 리셋 → 서보 ON → 홈 이동을 자동 수행
+- GUI "에러 복구 HOME 복귀" 버튼과 연동
+
+#### 3. GUI GRIP 상태 표시 개선
+- 기존: gripper_node 서비스 등록 즉시 `GRIP=ok` 표시 (초기화 미완료 상태에서도 초록)
+- 변경: `/gripper_service/state` 토픽의 `GripperState.ready` 필드 기준으로 판단
+- 그리퍼 Modbus INITIALIZE 완료 후에만 초록으로 표시
+
+#### 4. DRL TCP 브릿지 안정화 (`gripper_tcp_bridge.py` / `pick_place.launch.py`)
+- `drl_idle_stable_sec` 추가 — DRL 정지 후 안정화 대기 후 재시작
+- `post_drl_start_sleep_sec` 기본값 0.5 → 2.0초 (TCP 바인딩 여유 시간 확보)
+- `connect_timeout_sec` 기본값 20 → 60초
+- DRL 스크립트 내 `server_socket_open()` 실패 시 재시도 로직 추가
+- `gripper_tcp_port` launch 인수 추가
+
+#### 5. UX 수정 3종
+
+| # | 항목 | 내용 |
+|---|---|---|
+| 1 | 그리퍼 파라미터 중복 적용 | "설정 적용" 버튼 클릭 후 완료 전까지 비활성화 (debounce) |
+| 2 | 수동 gripper_close "파지 실패" 혼란 | 물체 없이 완전히 닫힌 경우 `success=True` + "닫힘 완료 (물체 없음)" 반환 |
+| 3 | LIFT/MOVE_TO_PLACE 중 검출 WARN 폭격 | `/pick_place_state` 구독 후 해당 상태에서 "검출되지 않음" WARN 억제 |
+
+#### 6. 낙하 오탐 및 recover_to_home 크래시 수정
+- `_srv_recover_to_home` 전체 try/except 감싸기 — servo-on 실패 시 warn 후 홈 이동 계속
+- 알람 대기 0.5 → 1.0초 증가
+
+---
+
 ## 자주 발생하는 문제
 
 ### GUI가 열리지 않는다 (Wayland)

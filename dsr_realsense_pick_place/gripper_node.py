@@ -1,30 +1,6 @@
 #!/usr/bin/env python3
-"""
-RH-P12-RN(A) Gripper ROS 2 Node  ─  v5  (DRL-only 방식)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v4 버그 수정
-  ▸ [버그1] SerialSendData 제거
-      flange_serial_open을 DrlStart로 실행하면 DRL 태스크가
-      종료되는 순간 포트가 닫힘. 이후 SerialSendData 호출 시
-      포트가 닫혀 있어 전송 실패.
-  ▸ [버그2] SerialSendData 포트 불일치 가능성
-      SerialSendData는 컨트롤러 박스 시리얼 포트를 대상으로
-      할 수 있으며, Flange Serial에 도달하지 않을 수 있음.
+# Doosan-E0509-ROBOTIS-RH-P12-RN-TCP-Bridge 패키지의 서비스를 래핑하는 ROS 2 그리퍼 제어 래퍼 노드.
 
-해결 방식
-  모든 그리퍼 명령을 DrlStart 하나로 처리.
-  DRL 스크립트 안에 open → write → wait → close를 모두 포함.
-  flange_serial_open 과 write 가 같은 DRL 태스크 안에 있으므로
-  포트가 닫히지 않은 상태에서 패킷이 전송됨.
-
-통신 경로
-  gripper_node → DrlStart.code (DRL 스크립트 문자열)
-              → dsr_control2 → DRFL API → TCP:컨트롤러
-              → flange_serial_open / flange_serial_write
-              → RS-485 → RH-P12-RN(A)
-"""
-
-import struct
 import threading
 import time
 
@@ -35,90 +11,11 @@ from rclpy.executors import MultiThreadedExecutor
 
 from std_srvs.srv import SetBool, Trigger
 from sensor_msgs.msg import JointState
+from rcl_interfaces.msg import SetParametersResult
 
-from dsr_msgs2.srv import DrlStart
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Modbus RTU 패킷 빌더
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class ModbusRTU:
-    @staticmethod
-    def crc16(data: bytes) -> bytes:
-        crc = 0xFFFF
-        for b in data:
-            crc ^= b
-            for _ in range(8):
-                crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
-        return struct.pack('<H', crc)
-
-    @classmethod
-    def fc06(cls, slave_id: int, addr: int, value: int) -> bytes:
-        """FC06: Write Single Register"""
-        body = bytes([slave_id, 0x06]) + struct.pack('>HH', addr, value)
-        return body + cls.crc16(body)
-
-    @classmethod
-    def fc16(cls, slave_id: int, start: int, values: list) -> bytes:
-        """FC16: Write Multiple Registers"""
-        n    = len(values)
-        body = (bytes([slave_id, 0x10])
-                + struct.pack('>HH', start, n)
-                + bytes([n * 2]))
-        for v in values:
-            body += struct.pack('>H', v)
-        return body + cls.crc16(body)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 레지스터 / 파라미터 상수
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class Reg:
-    TORQUE_ENABLE = 256
-    GOAL_CURRENT  = 275
-    GOAL_POSITION = 282
-
-class GP:
-    SLAVE_ID     = 1
-    STROKE_OPEN  = 0
-    STROKE_CLOSE = 1000   # ★ 실측값으로 교체
-    CUR_DEFAULT  = 400    # mA
-    CUR_CUBE     = 300    # mA
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DRL 스크립트 빌더
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def build_drl(packets: list[bytes], motion_wait: float = 0.0) -> str:
-    """
-    flange_serial_open → 패킷 전송 → (선택적 대기) → flange_serial_close
-    를 하나의 DRL 스크립트 문자열로 반환합니다.
-
-    packets      : 순서대로 전송할 Modbus RTU 바이트 패킷 리스트
-    motion_wait  : 마지막 패킷 전송 후 그리퍼 동작 대기 시간 (초)
-                   위치 명령 후 그리퍼가 이동을 완료할 때까지 필요
-    """
-    lines = [
-        "flange_serial_open("
-        "baudrate=57600, bytesize=DR_EIGHTBITS, "
-        "parity=DR_PARITY_NONE, stopbits=DR_STOPBITS_ONE)",
-        "wait(0.2)",
-    ]
-    for i, pkt in enumerate(packets):
-        # bytes → Python int 리스트 리터럴 → DRL flange_serial_write 인자
-        lines.append(f"flange_serial_write(bytes({list(pkt)}))")
-        # 패킷 사이 인터프레임 딜레이 (마지막 패킷 제외)
-        if i < len(packets) - 1:
-            lines.append("wait(0.1)")
-
-    if motion_wait > 0:
-        lines.append(f"wait({motion_wait})")
-
-    lines.append("flange_serial_close()")
-    return "\n".join(lines) + "\n"
+# TCP Bridge 패키지의 서비스 및 메시지 타입 임포트
+from dsr_gripper_tcp_interfaces.srv import SetMotionProfile, SetPosition, SetTorque
+from dsr_gripper_tcp_interfaces.msg import GripperState
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -131,59 +28,137 @@ class GripperNode(Node):
         super().__init__('rh_p12_rna_gripper')
         cb = ReentrantCallbackGroup()
 
-        # ── 파라미터 ──────────────────────────────────────────────
-        self.declare_parameter('robot_ns',     'dsr01')
-        self.declare_parameter('svc_timeout',  10.0)   # DRL 실행 시간 포함
-        self.declare_parameter('state_hz',     10.0)
-        self.declare_parameter('init_current', GP.CUR_DEFAULT)
-        self.declare_parameter('cube_current', GP.CUR_CUBE)
-        self.declare_parameter('stroke_close', GP.STROKE_CLOSE)
-        self.declare_parameter('motion_wait',  1.5)    # 위치 명령 후 대기 (초)
+        # ── 파라미터 선언 ──────────────────────────────────────────────
+        self.declare_parameter('robot_ns', 'dsr01')
+        self.declare_parameter('svc_timeout', 10.0)
+        self.declare_parameter('state_hz', 20.0)
+        self.declare_parameter('open_current', 400)
+        self.declare_parameter('close_current', 300)
+        self.declare_parameter('profile_velocity', 1500)
+        self.declare_parameter('profile_acceleration', 1000)
+        self.declare_parameter('stroke_open', 0)
+        self.declare_parameter('stroke_close', 1000)
+        self.declare_parameter('min_grip_pos', 500)
+        self.declare_parameter('max_grip_pos', 700)
 
-        ns              = self.get_parameter('robot_ns').value
-        self._timeout   = self.get_parameter('svc_timeout').value
-        self._cur_def   = self.get_parameter('init_current').value
-        self._cur_cube  = self.get_parameter('cube_current').value
-        self._st_close  = self.get_parameter('stroke_close').value
-        self._mot_wait  = self.get_parameter('motion_wait').value
+        self._robot_ns = self.get_parameter('robot_ns').value
+        self._timeout = self.get_parameter('svc_timeout').value
+        
+        self.open_current = self.get_parameter('open_current').value
+        self.close_current = self.get_parameter('close_current').value
+        self.profile_velocity = self.get_parameter('profile_velocity').value
+        self.profile_acceleration = self.get_parameter('profile_acceleration').value
+        self.stroke_open = self.get_parameter('stroke_open').value
+        self.stroke_close = self.get_parameter('stroke_close').value
+        self.min_grip_pos = self.get_parameter('min_grip_pos').value
+        self.max_grip_pos = self.get_parameter('max_grip_pos').value
 
-        # ── 서비스 클라이언트 (DrlStart 하나만 사용) ──────────────
-        ns = self.get_parameter('robot_ns').value or 'dsr01'
-        prefix = f'/{ns}'
-        self._cli_drl = self.create_client(
-            DrlStart, f'{prefix}/drl/drl_start',
+        # 파라미터 동적 변경 콜백 등록
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
+        # ── 서비스 클라이언트 (TCP Bridge 서비스 연동) ──────────────────
+        # gripper_service 노드가 제공하는 서비스 호출
+        self._cli_set_profile = self.create_client(
+            SetMotionProfile, '/gripper_service/set_motion_profile',
+            callback_group=cb)
+        self._cli_set_position = self.create_client(
+            SetPosition, '/gripper_service/set_position',
+            callback_group=cb)
+        self._cli_set_torque = self.create_client(
+            SetTorque, '/gripper_service/set_torque',
             callback_group=cb)
 
-        # ── 퍼블리셔 ──────────────────────────────────────────────
+        # ── 서브스크라이버 (TCP Bridge 상태 모니터링) ──────────────────
+        self._sub_gripper_state = self.create_subscription(
+            GripperState, '/gripper_service/state',
+            self._cb_gripper_state, 10,
+            callback_group=cb)
+
+        # ── 퍼블리셔 (기존 /gripper/state 유지) ──────────────────────
         self._pub = self.create_publisher(JointState, '/gripper/state', 10)
         self.create_timer(
             1.0 / self.get_parameter('state_hz').value,
             self._pub_state, callback_group=cb)
 
-        # ── 서비스 서버 ───────────────────────────────────────────
+        # ── 서비스 서버 (기존 서비스 유지) ───────────────────────────
         self.create_service(Trigger, '/gripper/open',
-                            self._srv_open,   callback_group=cb)
+                            self._srv_open, callback_group=cb)
         self.create_service(Trigger, '/gripper/close',
-                            self._srv_close,  callback_group=cb)
+                            self._srv_close, callback_group=cb)
         self.create_service(Trigger, '/gripper/stop',
-                            self._srv_stop,   callback_group=cb)
+                            self._srv_stop, callback_group=cb)
         self.create_service(SetBool, '/gripper/enable',
                             self._srv_enable, callback_group=cb)
 
-        # ── 내부 상태 ─────────────────────────────────────────────
-        self._stroke = 0
-        self._torque = False
-        self._ready  = False
-        self._drl_lock = threading.Lock()
+        # ── 내부 상태 변수 ───────────────────────────────────────────
+        self._last_state = None
+        self._lock = threading.Lock()
 
-        # ── 초기화 타이머 (executor 기동 후 실행) ─────────────────
-        self._init_timer = self.create_timer(
-            0.5, self._init_once, callback_group=cb)
-
-        self.get_logger().info("노드 생성 완료 — 초기화 대기 중 (0.5s)")
+        self.get_logger().info("그리퍼 래퍼 노드 기동 완료. TCP Bridge 서비스를 대기합니다.")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # threading.Event 기반 서비스 호출
+    # 파라미터 업데이트 콜백
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _on_set_parameters(self, params):
+        for param in params:
+            if param.name == 'open_current':
+                self.open_current = param.value
+                self.get_logger().info(f"파라미터 변경: open_current -> {param.value}")
+            elif param.name == 'close_current':
+                self.close_current = param.value
+                self.get_logger().info(f"파라미터 변경: close_current -> {param.value}")
+            elif param.name == 'profile_velocity':
+                self.profile_velocity = param.value
+                self.get_logger().info(f"파라미터 변경: profile_velocity -> {param.value}")
+            elif param.name == 'profile_acceleration':
+                self.profile_acceleration = param.value
+                self.get_logger().info(f"파라미터 변경: profile_acceleration -> {param.value}")
+            elif param.name == 'stroke_open':
+                self.stroke_open = param.value
+                self.get_logger().info(f"파라미터 변경: stroke_open -> {param.value}")
+            elif param.name == 'stroke_close':
+                self.stroke_close = param.value
+                self.get_logger().info(f"파라미터 변경: stroke_close -> {param.value}")
+            elif param.name == 'min_grip_pos':
+                self.min_grip_pos = param.value
+                self.get_logger().info(f"파라미터 변경: min_grip_pos -> {param.value}")
+            elif param.name == 'max_grip_pos':
+                self.max_grip_pos = param.value
+                self.get_logger().info(f"파라미터 변경: max_grip_pos -> {param.value}")
+        return SetParametersResult(successful=True, reason='Parameters updated.')
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # TCP Bridge 상태 피드백 수신 콜백
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _cb_gripper_state(self, msg: GripperState):
+        with self._lock:
+            self._last_state = msg
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 상태 퍼블리시 콜백 (기존 JointState 토픽과 호환성 유지)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _pub_state(self):
+        with self._lock:
+            state = self._last_state
+
+        if state is None:
+            return
+
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = ['gripper_joint']
+        # TCP Bridge의 0~1150 raw position값을 기존 GUI/노드가 그대로 받을 수 있게 float 리스트로 래핑
+        msg.position = [float(state.present_position)]
+        msg.velocity = [float(state.present_velocity)]
+        # effort 값에 실시간 전류 피드백을 전달하여 GUI 등에서 모니터링 가능하게 호환 처리
+        msg.effort = [float(state.present_current)]
+        self._pub.publish(msg)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 비동기 서비스 호출 헬퍼
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _call_service(self, client, request, label: str):
@@ -191,7 +166,7 @@ class GripperNode(Node):
             self.get_logger().error(f"서비스 미연결: {label}")
             return None
 
-        event  = threading.Event()
+        event = threading.Event()
         result = [None]
 
         def _done(future):
@@ -212,152 +187,142 @@ class GripperNode(Node):
             return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # DRL 헬퍼
+    # 모션 제어 로직 구현
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def _drl(self, code: str, label: str = "DrlStart") -> bool:
-        """DRL 스크립트를 컨트롤러에 전송합니다."""
-        self.get_logger().debug(f"[DRL] {label}\n{code}")
-        req = DrlStart.Request()
-        req.robot_system = 0
-        req.code = code
-        res = self._call_service(self._cli_drl, req, label)
-        ok  = bool(res and res.success)
-        if not ok:
-            self.get_logger().error(f"[DRL 실패] {label}")
-        return ok
+    def _move(self, position: int, goal_current: int) -> tuple:
+        # 1. 모션 프로파일(전류 한계, 속도, 가속도) 인가
+        profile_req = SetMotionProfile.Request()
+        profile_req.goal_current = goal_current
+        profile_req.profile_velocity = self.profile_velocity
+        profile_req.profile_acceleration = self.profile_acceleration
+        
+        self.get_logger().info(
+            f"모션 프로파일 인가 요청: current={goal_current}mA, vel={self.profile_velocity}, acc={self.profile_acceleration}")
+        
+        profile_res = self._call_service(self._cli_set_profile, profile_req, "set_motion_profile")
+        if not profile_res or not profile_res.success:
+            return False, "모션 프로파일 설정 실패"
 
-    def _run_packets(self, packets: list[bytes],
-                     motion_wait: float, label: str) -> bool:
-        """패킷 리스트를 DRL 스크립트로 변환 후 실행합니다."""
-        code = build_drl(packets, motion_wait)
-        with self._drl_lock:
-            return self._drl(code, label)
+        # 2. 이동 명령 전송
+        pos_req = SetPosition.Request()
+        pos_req.position = position
+        
+        self.get_logger().info(f"이동 명령 전송: position={position}")
+        pos_res = self._call_service(self._cli_set_position, pos_req, "set_position")
+        if not pos_res or not pos_res.success:
+            return False, "이동 명령 실행 실패"
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 초기화 (one-shot 타이머 콜백)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    def _init_once(self):
-        """executor 기동 후 한 번만 실행 — Torque Enable + Goal Current 초기값 설정"""
-        self._init_timer.cancel()
-
-        self.get_logger().info("그리퍼 초기화 시작...")
-
-        # drl_start 서비스 연결 대기
-        waited = 0.0
-        while not self._cli_drl.service_is_ready() and waited < 30.0:
-            time.sleep(0.5)
-            waited += 0.5
-        if not self._cli_drl.service_is_ready():
-            self.get_logger().error("drl_start 서비스 연결 실패")
-            return
-
-        # DRL 스크립트: open → Torque Enable → Goal Current → close
-        pkts = [
-            ModbusRTU.fc06(GP.SLAVE_ID, Reg.TORQUE_ENABLE, 1),
-            ModbusRTU.fc06(GP.SLAVE_ID, Reg.GOAL_CURRENT,  self._cur_def),
-        ]
-        if not self._run_packets(pkts, motion_wait=0.0, label="Init"):
-            self.get_logger().error("초기화 실패")
-            return
-
-        self._torque = True
-        self._ready  = True
-        self.get_logger().info("초기화 완료 ✓  서비스 요청 수신 가능")
+        return True, "동작 완료"
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 이동
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    def _move(self, stroke: int, current: int) -> tuple:
-        if not self._ready:
-            return False, "초기화 미완료"
-        if not self._torque:
-            return False, "토크 OFF — /gripper/enable 먼저 호출"
-
-        # DRL 스크립트: open → Goal Current → Goal Position → wait → close
-        pkts = [
-            ModbusRTU.fc06(GP.SLAVE_ID, Reg.GOAL_CURRENT,  current),
-            ModbusRTU.fc16(GP.SLAVE_ID, Reg.GOAL_POSITION, [stroke, 0]),
-        ]
-        label = f"Move stroke={stroke} current={current}mA"
-        ok = self._run_packets(pkts, motion_wait=self._mot_wait, label=label)
-
-        if ok:
-            self._stroke = stroke
-        return ok, ("완료" if ok else "실패")
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 상태 퍼블리시
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    def _pub_state(self):
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name         = ['gripper_joint']
-        msg.position     = [float(self._stroke)]
-        msg.velocity     = [0.0]
-        msg.effort       = [float(self._cur_def if self._torque else 0)]
-        self._pub.publish(msg)
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 서비스 핸들러
+    # 서비스 핸들러 구현
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _srv_open(self, _, res: Trigger.Response):
-        res.success, res.message = self._move(GP.STROKE_OPEN, self._cur_def)
+        res.success, res.message = self._move(self.stroke_open, self.open_current)
         return res
 
     def _srv_close(self, _, res: Trigger.Response):
-        res.success, res.message = self._move(self._st_close, self._cur_cube)
+        # 1. 기존 _move 함수를 사용해 모션 프로파일 설정 및 닫기 위치(1000) 인가
+        ok, msg = self._move(self.stroke_close, self.close_current)
+        if not ok:
+            res.success = False
+            res.message = f"이동 명령 전송 실패 - {msg}"
+            return res
+
+        # 2. 비동기 20Hz 상태 모니터링 루프 가동 (최대 2.5초)
+        start_time = time.time()
+        grasp_success = False
+        stable_count = 0
+        pos = None  # 루프 밖에서도 참조할 수 있도록 초기화
+
+        while time.time() - start_time < 2.5:
+            with self._lock:
+                state = self._last_state
+
+            if state is not None:
+                pos = state.present_position
+                curr = state.present_current
+
+                # 지정된 범위 내에서 전류 한계치 돌파 체크
+                if self.min_grip_pos <= pos <= self.max_grip_pos:
+                    if curr >= self.close_current:
+                        stable_count += 1
+                        if stable_count >= 2: # 2회 연속 감지 시 파지 성공으로 판단
+                            grasp_success = True
+                            # 물체를 쥐고 있는 현재 위치로 명령을 갱신 인가하여 락 고정
+                            pos_req = SetPosition.Request()
+                            pos_req.position = int(pos)
+                            self._cli_set_position.call_async(pos_req)
+                            break
+                    else:
+                        stable_count = 0
+
+                # 범위를 완전히 탈조하여 다 닫혀버린 경우 (물체 없음 — 수동 조작 또는 빈 상태)
+                if pos > self.max_grip_pos:
+                    self.get_logger().info(f"그리퍼 완전 닫힘 (물체 없음, 위치: {pos})")
+                    grasp_success = False
+                    break
+
+            time.sleep(0.05)
+
+        # 물체를 쥔 경우만 파지 성공. 완전히 닫힌 경우(수동 조작 등)는 성공으로 처리해
+        # GUI에 불필요한 '파지 실패' 알림이 표시되지 않도록 한다.
+        if grasp_success:
+            res.success = True
+            res.message = "파지 성공"
+        elif not grasp_success and pos is not None and pos > self.max_grip_pos:
+            res.success = True
+            res.message = "닫힘 완료 (물체 없음)"
+        else:
+            res.success = False
+            res.message = "파지 실패 (물체 누락)"
         return res
 
     def _srv_stop(self, _, res: Trigger.Response):
-        pkts = [ModbusRTU.fc06(GP.SLAVE_ID, Reg.TORQUE_ENABLE, 0)]
-        res.success = self._run_packets(pkts, motion_wait=0.0, label="Torque OFF")
-        res.message = "토크 OFF" if res.success else "실패"
-        if res.success:
-            self._torque = False
+        req = SetTorque.Request()
+        req.enabled = False
+        self.get_logger().info("토크 비활성화 요청")
+        res_torque = self._call_service(self._cli_set_torque, req, "set_torque")
+        res.success = bool(res_torque and res_torque.success)
+        res.message = "토크 비활성화 완료" if res.success else "토크 비활성화 실패"
         return res
 
     def _srv_enable(self, req: SetBool.Request, res: SetBool.Response):
-        val  = 1 if req.data else 0
-        pkts = [ModbusRTU.fc06(GP.SLAVE_ID, Reg.TORQUE_ENABLE, val)]
-        label = f"Torque {'ON' if req.data else 'OFF'}"
-        res.success = self._run_packets(pkts, motion_wait=0.0, label=label)
-        res.message = (label if res.success else "실패")
-        if res.success:
-            self._torque = bool(req.data)
+        torque_req = SetTorque.Request()
+        torque_req.enabled = req.data
+        label = f"토크 {'활성화' if req.data else '비활성화'}"
+        self.get_logger().info(f"{label} 요청")
+        res_torque = self._call_service(self._cli_set_torque, torque_req, "set_torque")
+        res.success = bool(res_torque and res_torque.success)
+        res.message = f"{label} 완료" if res.success else f"{label} 실패"
         return res
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Motion Planning 노드 호출용 퍼블릭 메서드
+    # 타 노드 호출용 퍼블릭 메서드 (호환성 유지)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def grip_cube(self) -> bool:
-        ok, msg = self._move(self._st_close, self._cur_cube)
-        self.get_logger().info(f"grip_cube → {msg}")
+        ok, msg = self._move(self.stroke_close, self.close_current)
+        self.get_logger().info(f"grip_cube -> {msg}")
         return ok
 
     def release(self) -> bool:
-        ok, msg = self._move(GP.STROKE_OPEN, self._cur_def)
-        self.get_logger().info(f"release → {msg}")
+        ok, msg = self._move(self.stroke_open, self.open_current)
+        self.get_logger().info(f"release -> {msg}")
         return ok
 
     def move_stroke(self, stroke: int, current: int | None = None) -> bool:
-        ok, _ = self._move(stroke, current or self._cur_def)
+        ok, _ = self._move(stroke, current or self.open_current)
         return ok
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 소멸자
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
     def destroy_node(self):
-        if rclpy.ok():
-            self.get_logger().info("노드 종료 — 토크 OFF")
-            pkts = [ModbusRTU.fc06(GP.SLAVE_ID, Reg.TORQUE_ENABLE, 0)]
-            self._run_packets(pkts, motion_wait=0.0, label="shutdown")
+        # 안전을 위해 노드가 파괴될 때 토크를 끕니다.
+        req = SetTorque.Request()
+        req.enabled = False
+        if self._cli_set_torque.service_is_ready():
+            self._cli_set_torque.call_async(req)
         super().destroy_node()
 
 

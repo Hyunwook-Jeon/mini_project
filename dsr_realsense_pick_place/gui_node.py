@@ -76,18 +76,104 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QVBoxLayout,
     QWidget,
+    QSlider,
+    QSpinBox,
+    QFrame,
 )
+from PyQt5.QtGui import QPalette, QFont
 from PyQt5.QtCore import QLibraryInfo
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, JointState
 
 from rcl_interfaces.msg import Parameter as RclParameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParameters
 from std_msgs.msg import Int32, String
 
 from std_srvs.srv import Trigger
+from dsr_gripper_tcp_interfaces.msg import GripperState
 
 os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = QLibraryInfo.location(QLibraryInfo.PluginsPath)
+
+
+class RealTimeGraphWidget(QWidget):
+    """실시간 그리퍼 전류를 롤링 플롯 형태로 시각화하는 커스텀 위젯."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.data = []
+        self.max_len = 100
+        self.max_value = 100.0
+        self.setMinimumHeight(100)
+
+    def add_data(self, value):
+        self.data.append(float(value))
+        if len(self.data) > self.max_len:
+            self.data.pop(0)
+        current_max = max(self.data) if self.data else 0.0
+        self.max_value = max(100.0, current_max * 1.2)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+        
+        # 다크 테마 배경 칠하기
+        painter.fillRect(0, 0, width, height, QColor(30, 30, 30))
+
+        # 회색 격자선 그리기
+        grid_pen = QPen(QColor(60, 60, 60), 1, Qt.DashLine)
+        painter.setPen(grid_pen)
+        for i in range(1, 4):
+            y = int(height * i / 4)
+            painter.drawLine(0, y, width, y)
+        for i in range(1, 10):
+            x = int(width * i / 10)
+            painter.drawLine(x, 0, x, height)
+
+        # 실시간 플롯 라인 그리기 (최고점 기준 10% 단위 초록-노랑-빨강 그라데이션)
+        if len(self.data) >= 2:
+            x_step = width / (self.max_len - 1)
+            for i in range(len(self.data) - 1):
+                val = self.data[i+1]
+                t = val / self.max_value
+                t = max(0.0, min(1.0, t))
+                # 10% 단위로 끊기
+                t_discrete = round(t * 10) / 10.0
+
+                if t_discrete <= 0.5:
+                    # 초록 (0, 255, 0) -> 노랑 (255, 255, 0)
+                    r = int(t_discrete * 2.0 * 255)
+                    g = 255
+                    b = 0
+                else:
+                    # 노랑 (255, 255, 0) -> 빨강 (255, 0, 0)
+                    r = 255
+                    g = int((1.0 - (t_discrete - 0.5) * 2.0) * 255)
+                    b = 0
+
+                color = QColor(r, g, b)
+                line_pen = QPen(color, 2, Qt.SolidLine)
+                painter.setPen(line_pen)
+
+                x1 = i * x_step
+                y1 = height - (self.data[i] / self.max_value) * height
+                x2 = (i + 1) * x_step
+                y2 = height - (self.data[i+1] / self.max_value) * height
+
+                y1 = max(0.0, min(float(height), y1))
+                y2 = max(0.0, min(float(height), y2))
+
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        # 우상단에 텍스트 표시
+        text_pen = QPen(QColor(255, 255, 255))
+        painter.setPen(text_pen)
+        painter.setFont(QFont('Arial', 9, QFont.Bold))
+        curr_val = self.data[-1]
+        painter.drawText(10, 20, f'Current: {curr_val:.0f} mA')
 
 
 class PickPlaceGuiNode(Node):
@@ -123,6 +209,8 @@ class PickPlaceGuiNode(Node):
         self.bridge = CvBridge() if CvBridge is not None else None
         self.latest_qimage = None
         self.detected_objects = []
+        self._last_nonempty_objects = []
+        self._last_nonempty_objects_time = 0.0
         self.selected_label = ''
         self.pick_place_state = 'IDLE'
         self._latest_raw_detections = []
@@ -134,6 +222,10 @@ class PickPlaceGuiNode(Node):
         self.system_status_items = []
         self._last_system_status_check = 0.0
 
+        # 실시간 그리퍼 상태 캐시
+        self.gripper_present_position = 0.0
+        self.gripper_present_current = 0.0
+
         # GUI는 직접 로봇을 움직이지 않고 "어떤 물체를 집을지"만 알린다.
         self.pub_selected = self.create_publisher(String, '/selected_object_label', 10)
 
@@ -141,6 +233,7 @@ class PickPlaceGuiNode(Node):
         self.cli_go_home       = self.create_client(Trigger, '/pick_place/go_home')
         self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
+        self.cli_recover_to_home = self.create_client(Trigger, '/pick_place/recover_to_home')
         self.cli_e_stop        = self.create_client(Trigger, '/pick_place/e_stop')
         self.cli_cancel        = self.create_client(Trigger, '/pick_place/cancel')
         self.cli_e_stop_reset  = self.create_client(Trigger, '/pick_place/e_stop_reset')
@@ -150,14 +243,27 @@ class PickPlaceGuiNode(Node):
         self.cli_servo_on         = self.create_client(Trigger, '/pick_place/servo_on')
         self.cli_safety_normal    = self.create_client(Trigger, '/pick_place/safety_normal')
         self.cli_safety_backdrive = self.create_client(Trigger, '/pick_place/safety_backdrive')
+        
         self.cli_object_get_parameters = self.create_client(GetParameters, '/object_detector/get_parameters')
         self.cli_object_set_parameters = self.create_client(SetParameters, '/object_detector/set_parameters')
+        
+        self.cli_gripper_get_parameters = self.create_client(GetParameters, '/rh_p12_rna_gripper/get_parameters')
+        self.cli_gripper_set_parameters = self.create_client(SetParameters, '/rh_p12_rna_gripper/set_parameters')
 
         # 로봇 하드웨어 상태 / 속도 모드 (pick_place_node 폴링 결과 수신)
         self.hw_state   = -1   # -1 = unknown
         self.speed_mode = 0    # 0 = NORMAL
         self.create_subscription(Int32, '/robot_hw_state',  self._cb_hw_state, 10)
         self.create_subscription(Int32, '/robot_speed_mode', self._cb_speed_mode, 10)
+
+        # 그리퍼 서비스 ready 상태 (INITIALIZE 완료 여부)
+        self.gripper_hw_ready = False
+        self.create_subscription(
+            GripperState, '/gripper_service/state', self._cb_gripper_service_state, 10)
+
+        # 실시간 그리퍼 상태 수신 구독 (기존 토픽 및 브릿지 노드용 토픽 모두 수신 가능하도록 다중 등록)
+        self.create_subscription(JointState, '/gripper/state', self._cb_gripper_joint_state, 10)
+        self.create_subscription(JointState, '/gripper_service/joint_state', self._cb_gripper_joint_state, 10)
 
         if self.use_local_yolo:
             self._init_local_yolo()
@@ -170,6 +276,17 @@ class PickPlaceGuiNode(Node):
             self.create_subscription(Image, '/detection_debug_image', self._cb_image, qos_profile_sensor_data)
             self.create_subscription(String, '/detected_objects', self._cb_objects, 10)
         self.create_subscription(String, '/pick_place_state', self._cb_state, 10)
+
+    def _cb_gripper_joint_state(self, msg: JointState):
+        target_name = None
+        for name in msg.name:
+            if 'gripper_joint' in name or 'rh_p12_rn' in name:
+                target_name = name
+                break
+        if target_name is not None:
+            idx = msg.name.index(target_name)
+            self.gripper_present_position = msg.position[idx]
+            self.gripper_present_current = msg.effort[idx]
 
     def _repo_root(self) -> Path:
         return Path(__file__).resolve().parent.parent
@@ -547,14 +664,26 @@ class PickPlaceGuiNode(Node):
         except json.JSONDecodeError:
             self.get_logger().warn('detected_objects JSON 파싱 실패')
             return
-        self.detected_objects = payload.get('objects', [])
+        objects = payload.get('objects', [])
+        now = time.monotonic()
+        if objects:
+            self._last_nonempty_objects = objects
+            self._last_nonempty_objects_time = now
+            self.detected_objects = objects
+        elif now - self._last_nonempty_objects_time < 1.0:
+            self.detected_objects = list(self._last_nonempty_objects)
+        else:
+            self.detected_objects = []
         self.selected_label = payload.get('selected_label', '')
-        self.last_objects_time = time.monotonic()
+        self.last_objects_time = now
 
     def _cb_state(self, msg: String):
         # 상태 문자열은 pick_place_node가 발행하는 값을 그대로 사용한다.
         self.pick_place_state = msg.data
         self.last_state_time = time.monotonic()
+
+    def _cb_gripper_service_state(self, msg: GripperState):
+        self.gripper_hw_ready = msg.ready
 
     def _cb_hw_state(self, msg: Int32):
         self.hw_state = msg.data
@@ -605,7 +734,7 @@ class PickPlaceGuiNode(Node):
             ('CAM', 'ok' if fresh(self.last_image_time) else 'bad'),
             ('DET', 'ok' if fresh(self.last_objects_time) else 'bad'),
             ('PICK', 'ok' if ready(self.cli_run_once) and fresh(self.last_state_time) else 'bad'),
-            ('GRIP', 'ok' if ready(self.cli_gripper_open) and ready(self.cli_gripper_close) else 'bad'),
+            ('GRIP', 'ok' if self.gripper_hw_ready else 'bad'),
             ('HW', 'ok' if fresh(self.last_hw_state_time) else 'warn'),
             ('SPD', 'ok' if fresh(self.last_speed_mode_time) else 'warn'),
         ]
@@ -663,6 +792,27 @@ class PickPlaceGui(QWidget):
             self.system_status_labels[key] = label
             status_bar_layout.addWidget(label)
         left_box.addWidget(self.system_status_bar, 0, Qt.AlignLeft)
+
+        # 상태 그룹박스 (좌측 상단으로 이동 및 가로 콤팩트 정렬)
+        status_group = QGroupBox('상태')
+        status_group.setMaximumHeight(54)
+        status_layout = QHBoxLayout(status_group)
+        status_layout.setContentsMargins(8, 2, 8, 2)
+        status_layout.setSpacing(12)
+
+        self.state_label = QLabel('Pick & Place 상태: IDLE')
+        self.selection_label = QLabel('선택 물체: 자동 선택')
+        self.selection_status_label = QLabel('선택 상태: 자동으로 가장 가까운 물체를 사용')
+        self.command_status_label = QLabel('')
+        self.command_status_label.setStyleSheet('color: #b0b0b0; font-weight: bold;')
+
+        status_layout.addWidget(self.state_label)
+        status_layout.addWidget(self.selection_label)
+        status_layout.addWidget(self.selection_status_label)
+        status_layout.addWidget(self.command_status_label)
+        status_layout.addStretch(1)
+
+        left_box.addWidget(status_group)
 
         compact_settings_group = QGroupBox('모델 설정 / 수동 캘리브레이션')
         compact_settings_group.setMaximumHeight(108)
@@ -797,34 +947,143 @@ class PickPlaceGui(QWidget):
         emergency_layout.addWidget(self.cancel_button)
         emergency_layout.addWidget(self.e_stop_reset_button)
 
-        status_group = QGroupBox('상태')
-        status_layout = QVBoxLayout(status_group)
-        self.state_label = QLabel('Pick & Place 상태: IDLE')
-        self.selection_label = QLabel('선택 물체: 자동 선택')
-        self.selection_status_label = QLabel('선택 상태: 자동으로 가장 가까운 물체를 사용')
-        self.command_status_label = QLabel('')
-        self.command_status_label.setStyleSheet('color: #b0b0b0; font-weight: bold;')
-        status_layout.addWidget(self.state_label)
-        status_layout.addWidget(self.selection_label)
-        status_layout.addWidget(self.selection_status_label)
-        status_layout.addWidget(self.command_status_label)
+
 
         control_group = QGroupBox('수동 제어')
-        control_layout = QVBoxLayout(control_group)
+        control_grid = QGridLayout(control_group)
+        control_grid.setSpacing(6)
+        control_grid.setContentsMargins(8, 6, 8, 6)
+
         self.home_button = QPushButton('HOME 이동')
+        self.home_button.setMinimumHeight(32)
         self.home_button.clicked.connect(self._go_home)
+
+        self.recover_home_button = QPushButton('에러 복구 & HOME 복귀')
+        self.recover_home_button.setMinimumHeight(32)
+        self.recover_home_button.clicked.connect(self._recover_to_home)
+
         self.gripper_open_button = QPushButton('그리퍼 OPEN')
+        self.gripper_open_button.setMinimumHeight(32)
         self.gripper_open_button.clicked.connect(self._gripper_open)
+
         self.gripper_close_button = QPushButton('그리퍼 CLOSE')
+        self.gripper_close_button.setMinimumHeight(32)
         self.gripper_close_button.clicked.connect(self._gripper_close)
-        control_layout.addWidget(self.home_button)
-        control_layout.addWidget(self.gripper_open_button)
-        control_layout.addWidget(self.gripper_close_button)
+
+        control_grid.addWidget(self.home_button, 0, 0)
+        control_grid.addWidget(self.recover_home_button, 0, 1)
+        control_grid.addWidget(self.gripper_open_button, 1, 0)
+        control_grid.addWidget(self.gripper_close_button, 1, 1)
+
+        # ── 그리퍼 정밀 전류 및 속도/가속도 제어 패널 ───────────────────────
+        self.gripper_ctrl_group = QGroupBox('그리퍼 정밀 전류 제어')
+        gripper_ctrl_layout = QVBoxLayout(self.gripper_ctrl_group)
+        gripper_ctrl_layout.setContentsMargins(8, 6, 8, 6)
+        gripper_ctrl_layout.setSpacing(4)
+
+        # 닫기 전류
+        close_curr_row = QHBoxLayout()
+        close_curr_label = QLabel('닫기 전류:')
+        close_curr_label.setFixedWidth(64)
+        self.close_curr_slider = QSlider(Qt.Horizontal)
+        self.close_curr_slider.setRange(50, 800)
+        self.close_curr_slider.setValue(300)
+        self.close_curr_spin = QSpinBox()
+        self.close_curr_spin.setRange(50, 800)
+        self.close_curr_spin.setValue(300)
+        self.close_curr_spin.setFixedWidth(54)
+        self.close_curr_slider.valueChanged.connect(self.close_curr_spin.setValue)
+        self.close_curr_spin.valueChanged.connect(self.close_curr_slider.setValue)
+        close_curr_row.addWidget(close_curr_label)
+        close_curr_row.addWidget(self.close_curr_slider)
+        close_curr_row.addWidget(self.close_curr_spin)
+        gripper_ctrl_layout.addLayout(close_curr_row)
+
+        # 열기 전류
+        open_curr_row = QHBoxLayout()
+        open_curr_label = QLabel('열기 전류:')
+        open_curr_label.setFixedWidth(64)
+        self.open_curr_slider = QSlider(Qt.Horizontal)
+        self.open_curr_slider.setRange(50, 800)
+        self.open_curr_slider.setValue(400)
+        self.open_curr_spin = QSpinBox()
+        self.open_curr_spin.setRange(50, 800)
+        self.open_curr_spin.setValue(400)
+        self.open_curr_spin.setFixedWidth(54)
+        self.open_curr_slider.valueChanged.connect(self.open_curr_spin.setValue)
+        self.open_curr_spin.valueChanged.connect(self.open_curr_slider.setValue)
+        open_curr_row.addWidget(open_curr_label)
+        open_curr_row.addWidget(self.open_curr_slider)
+        open_curr_row.addWidget(self.open_curr_spin)
+        gripper_ctrl_layout.addLayout(open_curr_row)
+
+        # 속도
+        vel_row = QHBoxLayout()
+        vel_label = QLabel('구동 속도:')
+        vel_label.setFixedWidth(64)
+        self.vel_slider = QSlider(Qt.Horizontal)
+        self.vel_slider.setRange(100, 1500)
+        self.vel_slider.setValue(1500)
+        self.vel_spin = QSpinBox()
+        self.vel_spin.setRange(100, 1500)
+        self.vel_spin.setValue(1500)
+        self.vel_spin.setFixedWidth(54)
+        self.vel_slider.valueChanged.connect(self.vel_spin.setValue)
+        self.vel_spin.valueChanged.connect(self.vel_slider.setValue)
+        vel_row.addWidget(vel_label)
+        vel_row.addWidget(self.vel_slider)
+        vel_row.addWidget(self.vel_spin)
+        gripper_ctrl_layout.addLayout(vel_row)
+
+        # 가속도
+        acc_row = QHBoxLayout()
+        acc_label = QLabel('구동 가속:')
+        acc_label.setFixedWidth(64)
+        self.acc_slider = QSlider(Qt.Horizontal)
+        self.acc_slider.setRange(100, 1000)
+        self.acc_slider.setValue(1000)
+        self.acc_spin = QSpinBox()
+        self.acc_spin.setRange(100, 1000)
+        self.acc_spin.setValue(1000)
+        self.acc_spin.setFixedWidth(54)
+        self.acc_slider.valueChanged.connect(self.acc_spin.setValue)
+        self.acc_spin.valueChanged.connect(self.acc_slider.setValue)
+        acc_row.addWidget(acc_label)
+        acc_row.addWidget(self.acc_slider)
+        acc_row.addWidget(self.acc_spin)
+        gripper_ctrl_layout.addLayout(acc_row)
+
+        # 모니터링 레이블
+        self.gripper_status_label = QLabel('실시간 - 전류: -- mA | 위치: ----')
+        self.gripper_status_label.setStyleSheet(
+            'color: #33ff33; font-weight: bold; background-color: #1e1e1e; padding: 4px; border-radius: 4px; font-family: monospace;'
+        )
+        self.gripper_status_label.setAlignment(Qt.AlignCenter)
+        gripper_ctrl_layout.addWidget(self.gripper_status_label)
+
+        # 실시간 전류 모니터링 그래프 추가
+        self.realtime_graph = RealTimeGraphWidget(self)
+        self.realtime_graph.setMinimumHeight(80)
+        gripper_ctrl_layout.addWidget(self.realtime_graph)
+
+        # 적용 버튼
+        self.gripper_apply_button = QPushButton('설정 적용')
+        self.gripper_apply_button.setMinimumHeight(28)
+        self.gripper_apply_button.clicked.connect(self._gripper_apply)
+        self.gripper_apply_button.setStyleSheet(
+            'QPushButton { background-color: #2a2a5a; color: white;'
+            '  font-weight: bold; border-radius: 5px; }'
+            'QPushButton:hover { background-color: #3a3a80; }'
+            'QPushButton:disabled { background-color: #444; color: #888; }'
+        )
+        gripper_ctrl_layout.addWidget(self.gripper_apply_button)
 
 
-        # ── 로봇 안전 모드 패널 ───────────────────────────────────────────
-        safety_group = QGroupBox('로봇 안전 모드')
+        # ── 시스템 안전 및 동작 모드 (기존 안전 모드 및 Doosan 안전 모드 통합) ──
+        safety_group = QGroupBox('시스템 안전 및 동작 모드')
         safety_layout = QVBoxLayout(safety_group)
+        safety_layout.setContentsMargins(8, 6, 8, 6)
+        safety_layout.setSpacing(4)
 
         # 하드웨어 상태 / 속도 모드 표시 행
         hw_row = QHBoxLayout()
@@ -846,7 +1105,7 @@ class PickPlaceGui(QWidget):
         # 속도 모드 전환 행
         speed_row = QHBoxLayout()
         self.speed_normal_button = QPushButton('🟢 정상 속도')
-        self.speed_normal_button.setMinimumHeight(34)
+        self.speed_normal_button.setMinimumHeight(32)
         self.speed_normal_button.setStyleSheet(
             'QPushButton { background-color: #1a5c1a; color: white;'
             '  font-weight: bold; border-radius: 5px; }'
@@ -856,7 +1115,7 @@ class PickPlaceGui(QWidget):
         self.speed_normal_button.clicked.connect(self._speed_normal)
 
         self.speed_reduced_button = QPushButton('🟡 감속 모드')
-        self.speed_reduced_button.setMinimumHeight(34)
+        self.speed_reduced_button.setMinimumHeight(32)
         self.speed_reduced_button.setStyleSheet(
             'QPushButton { background-color: #7a6000; color: white;'
             '  font-weight: bold; border-radius: 5px; }'
@@ -872,7 +1131,7 @@ class PickPlaceGui(QWidget):
         # 서보 OFF / ON 행
         servo_row = QHBoxLayout()
         self.servo_off_button = QPushButton('⚡ 서보 OFF')
-        self.servo_off_button.setMinimumHeight(34)
+        self.servo_off_button.setMinimumHeight(32)
         self.servo_off_button.setStyleSheet(
             'QPushButton { background-color: #5a0050; color: white;'
             '  font-weight: bold; border-radius: 5px; }'
@@ -882,7 +1141,7 @@ class PickPlaceGui(QWidget):
         self.servo_off_button.clicked.connect(self._servo_off)
 
         self.servo_on_button = QPushButton('🟢 서보 ON')
-        self.servo_on_button.setMinimumHeight(34)
+        self.servo_on_button.setMinimumHeight(32)
         self.servo_on_button.setEnabled(False)
         self.servo_on_button.setStyleSheet(
             'QPushButton { background-color: #006600; color: white;'
@@ -896,19 +1155,22 @@ class PickPlaceGui(QWidget):
         servo_row.addWidget(self.servo_on_button)
         safety_layout.addLayout(servo_row)
 
-        # ── Doosan 내장 안전 모드 패널 ──────────────────────────────────
-        dsr_safety_group = QGroupBox('Doosan 안전 모드')
-        dsr_safety_layout = QVBoxLayout(dsr_safety_group)
+        # 안전 구분선
+        divider = QFrame()
+        divider.setFrameShape(QFrame.HLine)
+        divider.setFrameShadow(QFrame.Sunken)
+        divider.setStyleSheet('background-color: #444;')
+        safety_layout.addWidget(divider)
 
+        # Doosan 안전 모드 통합 영역
         self.safety_mode_label = QLabel('현재 안전 모드: 알 수 없음')
         self.safety_mode_label.setStyleSheet(
             'font-weight: bold; padding: 3px 6px; border-radius: 4px;'
             'background-color: #2a2a2a; color: white;'
         )
-        dsr_safety_layout.addWidget(self.safety_mode_label)
+        safety_layout.addWidget(self.safety_mode_label)
 
         safety_mode_row = QHBoxLayout()
-
         self.safety_auto_button = QPushButton('🤖  정상 운전')
         self.safety_auto_button.setMinimumHeight(40)
         self.safety_auto_button.setToolTip('AUTONOMOUS — 정상 Pick & Place 자율 운전')
@@ -933,7 +1195,7 @@ class PickPlaceGui(QWidget):
 
         safety_mode_row.addWidget(self.safety_auto_button)
         safety_mode_row.addWidget(self.safety_backdrive_button)
-        dsr_safety_layout.addLayout(safety_mode_row)
+        safety_layout.addLayout(safety_mode_row)
 
         object_group = QGroupBox('검출된 물체 선택')
         object_layout = QVBoxLayout(object_group)
@@ -953,10 +1215,9 @@ class PickPlaceGui(QWidget):
         object_layout.addWidget(self.object_summary)
 
         right_panel.addWidget(emergency_group)
-        right_panel.addWidget(status_group)
         right_panel.addWidget(control_group)
+        right_panel.addWidget(self.gripper_ctrl_group)
         right_panel.addWidget(safety_group)
-        right_panel.addWidget(dsr_safety_group)
 
         right_panel.addWidget(object_group)
         right_panel.addStretch(1)
@@ -972,6 +1233,17 @@ class PickPlaceGui(QWidget):
         self.ros_node.publish_selected_label(label)
         if label:
             self.ros_node.call_trigger_service(self.ros_node.cli_run_once, 'pick_place/run_once')
+
+    def _recover_to_home(self):
+        self._call_manual_command(
+            key='recover_to_home',
+            client=self.ros_node.cli_recover_to_home,
+            service_label='pick_place/recover_to_home',
+            progress_text='에러 복구 및 HOME 복귀 중...',
+            done_text='에러 복구 및 HOME 복귀 완료',
+            timeout_sec=45.0,
+            wait_for_state=True,
+        )
 
     def _go_home(self):
         self._call_manual_command(
@@ -1007,6 +1279,53 @@ class PickPlaceGui(QWidget):
             wait_for_state=False,
             min_busy_sec=self._gripper_feedback_hold_sec,
         )
+
+    def _gripper_apply(self):
+        # 중복 클릭 방지: 이전 요청이 완료되기 전에는 재진입 불가
+        if getattr(self, '_gripper_apply_busy', False):
+            return
+        cli = self.ros_node.cli_gripper_set_parameters
+        if not cli.service_is_ready():
+            self.ros_node.get_logger().warn('그리퍼 set_parameters 서비스 미연결')
+            return
+
+        self._gripper_apply_busy = True
+        self.gripper_apply_button.setEnabled(False)
+
+        req = SetParameters.Request()
+
+        params = [
+            ('open_current', ParameterType.PARAMETER_INTEGER, int(self.open_curr_spin.value())),
+            ('close_current', ParameterType.PARAMETER_INTEGER, int(self.close_curr_spin.value())),
+            ('profile_velocity', ParameterType.PARAMETER_INTEGER, int(self.vel_spin.value())),
+            ('profile_acceleration', ParameterType.PARAMETER_INTEGER, int(self.acc_spin.value()))
+        ]
+
+        for name, p_type, val in params:
+            rp = RclParameter()
+            rp.name = name
+            rp.value = ParameterValue()
+            rp.value.type = p_type
+            rp.value.integer_value = val
+            req.parameters.append(rp)
+
+        future = cli.call_async(req)
+        future.add_done_callback(self._on_gripper_applied)
+
+    def _on_gripper_applied(self, future):
+        # rclpy 콜백 스레드에서 호출됨. Qt GUI는 _update_ui에서 안전하게 복원한다.
+        self._gripper_apply_busy = False
+        try:
+            results = future.result().results
+            ok = bool(results) and all(result.successful for result in results)
+        except Exception as e:
+            self.ros_node.get_logger().error(f'그리퍼 파라미터 적용 실패: {e}')
+            return
+        if ok:
+            self.ros_node.get_logger().info('그리퍼 정밀 제어 파라미터 적용 완료.')
+        else:
+            reason = next((r.reason for r in results if not r.successful), '')
+            self.ros_node.get_logger().warn(f'그리퍼 파라미터 적용 거절: {reason}')
 
     def _call_manual_command(
         self,
@@ -1330,14 +1649,19 @@ class PickPlaceGui(QWidget):
             self.ros_node.get_logger().warn(f'모델 경로 적용 거절: {reason}')
 
     def _update_ui(self):
+        # 그리퍼 파라미터 적용 버튼: 콜백 완료 후 Qt 스레드에서 안전하게 복원
+        if not getattr(self, '_gripper_apply_busy', False):
+            self.gripper_apply_button.setEnabled(True)
+
         self.ros_node.refresh_system_status()
         self._maybe_load_object_settings()
         self._maybe_apply_saved_model_path()
+        detected_snapshot = list(self.ros_node.detected_objects)
 
         # 카메라 영상은 최신 프레임이 있을 때만 갱신한다.
         if self.ros_node.latest_qimage is not None:
             pixmap = QPixmap.fromImage(self.ros_node.latest_qimage)
-            self._draw_object_frames_on_pixmap(pixmap)
+            self._draw_object_frames_on_pixmap(pixmap, detected_snapshot)
             scaled = pixmap.scaled(
                 self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
@@ -1378,6 +1702,7 @@ class PickPlaceGui(QWidget):
         self.home_button.setEnabled(command_enabled)
         self.gripper_open_button.setEnabled(command_enabled)
         self.gripper_close_button.setEnabled(command_enabled)
+        self.recover_home_button.setEnabled(command_enabled)
         self._update_manual_button_texts()
         self.auto_button.setEnabled(command_enabled and is_idle)
         object_param_ready = (
@@ -1388,6 +1713,42 @@ class PickPlaceGui(QWidget):
         self.calib_apply_button.setEnabled(object_param_ready and is_idle)
         self.model_browse_button.setEnabled(True)
         self.model_apply_button.setEnabled(self.ros_node.cli_object_set_parameters.service_is_ready())
+
+        # ── 그리퍼 정밀 제어 상태 및 활성화 제어 ─────────────────────────────
+        # 실시간 상태 레이블 업데이트
+        pres_curr = self.ros_node.gripper_present_current
+        pres_pos = self.ros_node.gripper_present_position
+        self.gripper_status_label.setText(f'실시간 - 전류: {pres_curr:.0f} mA | 위치: {pres_pos:.0f}')
+
+        # 실시간 그래프 데이터 추가
+        self.realtime_graph.add_data(pres_curr)
+
+        # 높은 전류 부하가 감지될 때 경고 표시 색상 부여
+        if pres_curr >= 500.0:
+            self.gripper_status_label.setStyleSheet(
+                'color: #ff3333; font-weight: bold; background-color: #4a0000; padding: 4px; border-radius: 4px; font-family: monospace;'
+            )
+        elif pres_curr >= 300.0:
+            self.gripper_status_label.setStyleSheet(
+                'color: #ffff33; font-weight: bold; background-color: #4a4a00; padding: 4px; border-radius: 4px; font-family: monospace;'
+            )
+        else:
+            self.gripper_status_label.setStyleSheet(
+                'color: #33ff33; font-weight: bold; background-color: #003a00; padding: 4px; border-radius: 4px; font-family: monospace;'
+            )
+            
+        # 그리퍼 파라미터 적용 버튼 및 컨트롤들 활성화 제어
+        gripper_param_ready = self.ros_node.cli_gripper_set_parameters.service_is_ready()
+        self.gripper_apply_button.setEnabled(gripper_param_ready and command_enabled)
+        
+        self.close_curr_slider.setEnabled(command_enabled)
+        self.close_curr_spin.setEnabled(command_enabled)
+        self.open_curr_slider.setEnabled(command_enabled)
+        self.open_curr_spin.setEnabled(command_enabled)
+        self.vel_slider.setEnabled(command_enabled)
+        self.vel_spin.setEnabled(command_enabled)
+        self.acc_slider.setEnabled(command_enabled)
+        self.acc_spin.setEnabled(command_enabled)
 
         # ── 안전 모드 버튼 ────────────────────────────────────────────
         # 속도 모드: EMERGENCY_STOP이 아닐 때 전환 가능
@@ -1457,13 +1818,13 @@ class PickPlaceGui(QWidget):
 
         # 같은 라벨의 물체가 여러 개 검출될 수 있으므로 버튼은 라벨 단위로만 만든다.
         labels = []
-        for item in self.ros_node.detected_objects:
+        for item in detected_snapshot:
             label = item.get('label', 'unknown')
             if label not in labels:
                 labels.append(label)
 
         self._refresh_buttons(self._stable_detection_labels(labels), object_buttons_enabled)
-        self._refresh_summary()
+        self._refresh_summary(detected_snapshot)
 
     def _update_manual_command_feedback(self, state: str):
         now = time.monotonic()
@@ -1502,6 +1863,7 @@ class PickPlaceGui(QWidget):
             'home': 'HOME 이동',
             'gripper_open': '그리퍼 OPEN',
             'gripper_close': '그리퍼 CLOSE',
+            'recover_to_home': '에러 복구 & HOME 복귀',
         }
         if self._manual_command is not None:
             key = self._manual_command.get('key')
@@ -1509,6 +1871,7 @@ class PickPlaceGui(QWidget):
         self.home_button.setText(texts['home'])
         self.gripper_open_button.setText(texts['gripper_open'])
         self.gripper_close_button.setText(texts['gripper_close'])
+        self.recover_home_button.setText(texts['recover_to_home'])
 
     def _stable_detection_labels(self, labels: list):
         """짧은 검출 누락으로 물체 버튼이 깜빡이지 않도록 라벨 목록을 안정화한다."""
@@ -1559,14 +1922,14 @@ class PickPlaceGui(QWidget):
             if label not in active_labels:
                 button.setVisible(False)
 
-    def _refresh_summary(self):
+    def _refresh_summary(self, detected_objects: list):
         # 우측 하단 요약은 "현재 검출된 물체 목록"을 사람이 빠르게 읽기 위한 영역이다.
-        if not self.ros_node.detected_objects:
+        if not detected_objects:
             self.object_summary.setText('검출된 물체가 없습니다.')
             return
 
         lines = []
-        for item in self.ros_node.detected_objects:
+        for item in detected_objects:
             pose = item.get('pose', {})
             yaw = pose.get('yaw_deg', None)
             yaw_text = f'{yaw:+.1f}deg' if isinstance(yaw, (int, float)) else 'N/A'
@@ -1592,7 +1955,7 @@ class PickPlaceGui(QWidget):
                 'border-radius: 3px; font-size: 11px; font-weight: bold;'
             )
 
-    def _draw_object_frames_on_pixmap(self, pixmap: QPixmap):
+    def _draw_object_frames_on_pixmap(self, pixmap: QPixmap, detected_objects: list):
         """검출 물체의 픽셀 중심에 간단한 좌표계(X/Z) 오버레이를 그린다."""
         if pixmap.isNull():
             return
@@ -1606,7 +1969,7 @@ class PickPlaceGui(QWidget):
             text_pen = QPen(QColor(255, 255, 255), 1)
             axis_len = 42
 
-            for item in self.ros_node.detected_objects:
+            for item in detected_objects:
                 u = int(item.get('pixel_u', -1))
                 v = int(item.get('pixel_v', -1))
                 if u < 0 or v < 0:
