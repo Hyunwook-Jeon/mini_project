@@ -75,6 +75,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
     QSlider,
@@ -780,9 +781,30 @@ class PickPlaceGui(QWidget):
         self.resize(1100, 720)
         self.move(40, 40)
 
-        root = QHBoxLayout(self)
+        # 최상위: 상태바(항상 표시) + 탭 위젯
+        root = QVBoxLayout(self)
 
-        left_box = QVBoxLayout()
+        self.tabs = QTabWidget()
+
+        # 탭1 "운전": 좌(상태/카메라) + 우(긴급 제어/물체 선택)
+        _tab_op = QWidget()
+        _op_row = QHBoxLayout(_tab_op)
+        op_left = QVBoxLayout()
+        op_right = QVBoxLayout()
+        _op_row.addLayout(op_left, 2)
+        _op_row.addLayout(op_right, 1)
+
+        # 탭2 "수동·설정": 수동 제어/그리퍼 파라미터/안전/모델·캘리브 (스크롤)
+        _tab_set = QWidget()
+        _set_outer = QVBoxLayout(_tab_set)
+        _set_scroll = QScrollArea()
+        _set_scroll.setWidgetResizable(True)
+        _set_content = QWidget()
+        set_col = QVBoxLayout(_set_content)
+        _set_scroll.setWidget(_set_content)
+        _set_outer.addWidget(_set_scroll)
+
+        # left_box는 호환을 위해 유지하지 않는다 — 각 그룹은 op_left/op_right/set_col에 직접 추가
         self.system_status_labels = {}
         self.system_status_bar = QWidget()
         self.system_status_bar.setFixedSize(276, 24)
@@ -799,7 +821,7 @@ class PickPlaceGui(QWidget):
             )
             self.system_status_labels[key] = label
             status_bar_layout.addWidget(label)
-        left_box.addWidget(self.system_status_bar, 0, Qt.AlignLeft)
+        root.addWidget(self.system_status_bar, 0, Qt.AlignLeft)
 
         # 상태 그룹박스 (좌측 상단으로 이동 및 가로 콤팩트 정렬)
         status_group = QGroupBox('상태')
@@ -820,7 +842,7 @@ class PickPlaceGui(QWidget):
         status_layout.addWidget(self.command_status_label)
         status_layout.addStretch(1)
 
-        left_box.addWidget(status_group)
+        op_left.addWidget(status_group)
 
         compact_settings_group = QGroupBox('모델 설정 / 수동 캘리브레이션')
         compact_settings_group.setMaximumHeight(108)
@@ -895,7 +917,7 @@ class PickPlaceGui(QWidget):
             calib_current_row.addWidget(value_label)
         calib_current_row.addStretch(1)
         compact_settings_layout.addLayout(calib_current_row)
-        left_box.addWidget(compact_settings_group)
+        set_col.addWidget(compact_settings_group)
 
         self.image_label = QLabel('카메라 영상 대기 중...')
         self.image_label.setAlignment(Qt.AlignCenter)
@@ -903,11 +925,10 @@ class PickPlaceGui(QWidget):
         self.image_label.setStyleSheet(
             'background-color: #1e1e1e; color: white; border-radius: 10px;'
         )
-        left_box.addWidget(self.image_label)
+        # image_label(카메라)은 탭과 무관하게 항상 보이도록 본문 좌측(cam_col)에 배치 — 아래 조립부 참고
 
-        right_panel = QVBoxLayout()
+        # ── 긴급 제어 패널 (탭1 "운전" 우측 상단) ──────────────────
 
-        # ── 긴급 제어 패널 (항상 최상단, 가장 눈에 띄게) ──────────────────
         emergency_group = QGroupBox('긴급 제어')
         emergency_layout = QVBoxLayout(emergency_group)
 
@@ -1084,12 +1105,14 @@ class PickPlaceGui(QWidget):
             'color: #33ff33; font-weight: bold; background-color: #1e1e1e; padding: 4px; border-radius: 4px; font-family: monospace;'
         )
         self.gripper_status_label.setAlignment(Qt.AlignCenter)
-        gripper_ctrl_layout.addWidget(self.gripper_status_label)
+        # 실시간 전류/위치 텍스트 한 줄은 운전 탭 우측 "검출 물체 선택" 아래에 배치(아래 조립부)
 
         # 실시간 전류 모니터링 그래프 추가
         self.realtime_graph = RealTimeGraphWidget(self)
-        self.realtime_graph.setMinimumHeight(80)
-        gripper_ctrl_layout.addWidget(self.realtime_graph)
+        # 카메라 아래(cam_col)에 모든 탭 상시 배치. 가로로 길게(더 긴 시간), 높이는 낮게.
+        self.realtime_graph.max_len = 300   # ≈30초 history (_update_ui 10Hz 기준)
+        self.realtime_graph.setMinimumHeight(90)
+        self.realtime_graph.setMaximumHeight(150)
 
         # 적용 버튼
         self.gripper_apply_button = QPushButton('설정 적용')
@@ -1266,16 +1289,36 @@ class PickPlaceGui(QWidget):
         self.object_summary.setWordWrap(True)
         object_layout.addWidget(self.object_summary)
 
-        right_panel.addWidget(emergency_group)
-        right_panel.addWidget(control_group)
-        right_panel.addWidget(self.gripper_ctrl_group)
-        right_panel.addWidget(safety_group)
+        # 탭1 "운전" 우측: 긴급 제어 + 물체 선택
+        op_right.addWidget(emergency_group)
+        op_right.addWidget(object_group)
+        # 검출 물체 선택 아래: 실시간 전류값 한 줄
+        op_right.addWidget(self.gripper_status_label)
+        op_right.addStretch(1)
 
-        right_panel.addWidget(object_group)
-        right_panel.addStretch(1)
+        # 탭2 "수동·설정": 수동 제어 + 그리퍼 파라미터 + 안전 모드 (+ 모델·캘리브은 위에서 추가됨)
+        set_col.addWidget(control_group)
+        set_col.addWidget(self.gripper_ctrl_group)
+        set_col.addWidget(safety_group)
+        set_col.addStretch(1)
 
-        root.addLayout(left_box, 2)
-        root.addLayout(right_panel, 1)
+        self.tabs.addTab(_tab_op, '운전')
+        self.tabs.addTab(_tab_set, '수동·설정')
+
+        # 카메라 영상은 어느 탭에서나 항상 보이도록 본문 좌측에 고정, 탭은 우측에 배치
+        body = QHBoxLayout()
+        cam_col = QVBoxLayout()
+        cam_col.addWidget(self.image_label)
+        # 실시간 전류 그래프: 카메라 바로 아래, 모든 탭 상시(가로 길게)
+        cam_col.addWidget(self.realtime_graph)
+        body.addLayout(cam_col, 2)
+        body.addWidget(self.tabs, 3)
+        root.addLayout(body)
+
+        # 스크린샷 등으로 포커스된 버튼이 키 입력에 잘못 눌리는 것 방지(서보 OFF 사고 등).
+        # 모든 버튼을 키보드 비포커스로 만들어 마우스 클릭으로만 동작하게 한다.
+        for _btn in self.findChildren(QPushButton):
+            _btn.setFocusPolicy(Qt.NoFocus)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._update_ui)
@@ -1863,6 +1906,8 @@ class PickPlaceGui(QWidget):
         safety_bd_svc     = self.ros_node.cli_safety_backdrive.service_is_ready()
         e_stop_reset_svc  = self.ros_node.cli_e_stop_reset.service_is_ready()
         gripper_param_svc = self.ros_node.cli_gripper_set_parameters.service_is_ready()
+        gripper_reinit_svc = self.ros_node.cli_gripper_reinit.service_is_ready()
+        gripper_enable_svc = self.ros_node.cli_gripper_enable.service_is_ready()
 
         gripper_hw_ready  = self.ros_node.gripper_hw_ready
         # hw=-1: 미수신, 6: E-STOP, 15: NOT_READY → 이 세 상태에서는 수동 명령 불가
@@ -1898,6 +1943,12 @@ class PickPlaceGui(QWidget):
         gripper_cmd_ok = command_enabled and gripper_hw_ready
         self.gripper_open_button.setEnabled(gripper_cmd_ok and gripper_open_svc)
         self.gripper_close_button.setEnabled(gripper_cmd_ok and gripper_close_svc)
+        # 그리퍼 리셋(재초기화): 그리퍼가 죽었을 때 복구용이므로 gripper_hw_ready를 요구하지 않는다.
+        self.gripper_reset_button.setEnabled(command_enabled and gripper_reinit_svc)
+        # 토크 ON/OFF: 초기화 완료 + 비활성(IDLE/DETECTING/ERROR) 상태에서만.
+        #   모션 중(PICK/LIFT/MOVE)엔 command_enabled=False라 자동 차단 → 모션 중 토크 OFF 사고 방지.
+        self.gripper_torque_on_button.setEnabled(gripper_cmd_ok and gripper_enable_svc)
+        self.gripper_torque_off_button.setEnabled(gripper_cmd_ok and gripper_enable_svc)
         self._update_manual_button_texts()
         # 물체 선택 / 자동 선택: IDLE + 모든 서비스 준비 + 그리퍼 HW 완료 필요
         full_system_ready  = command_enabled and is_idle and pick_svc and gripper_hw_ready

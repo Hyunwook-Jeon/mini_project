@@ -181,6 +181,7 @@ class PickPlaceNode(Node):
         self.target_pose: PoseStamped | None = None
         self.pick_requested = False
         self.pending_command: str | None = None
+        self._recovering = False   # recover_to_home 워커 스레드 중복 실행 가드
         # 긴급정지 / 태스크 취소용 이벤트
         # _stop_event가 set되면 _call_service가 즉시 _MotionInterrupt를 발생시킨다.
         self._stop_event = threading.Event()
@@ -889,7 +890,20 @@ class PickPlaceNode(Node):
                 res.success = False
                 res.message = "로봇이 에러 상태가 아닙니다."
                 return res
+            if self._recovering:
+                res.success = False
+                res.message = "이미 복구 중입니다."
+                return res
+            self._recovering = True
+        # 복구 시퀀스(sleep + 그리퍼 reinit 최대 90s + 홈 이동)를 서비스 콜백에서 직접
+        # 돌리면 executor 콜백 스레드를 ~2분 점유하고 E-STOP로도 못 끊는다.
+        # → 별도 스레드로 실행하고 서비스는 즉시 응답. GUI는 상태(IDLE 복귀)로 완료를 추적.
+        threading.Thread(target=self._recover_to_home_worker, daemon=True).start()
+        res.success = True
+        res.message = "에러 복구 및 홈 복귀를 시작했습니다."
+        return res
 
+    def _recover_to_home_worker(self):
         try:
             self.get_logger().info("에러 복구 및 안전 복귀 시퀀스를 시작합니다.")
 
@@ -932,16 +946,13 @@ class PickPlaceNode(Node):
                 self._object_lost_triggered = False
                 self._object_lost_debounce_count = 0
                 self.state = State.IDLE
-
-            res.success = True
-            res.message = "에러 복구 및 홈으로 복귀 성공 완료"
+            self.get_logger().info("에러 복구 및 홈으로 복귀 성공 완료")
         except Exception as e:
             self.get_logger().error(f'recover_to_home 실패: {e}')
             with self.state_lock:
                 self.state = State.ERROR
-            res.success = False
-            res.message = f"복구 실패: {e}"
-        return res
+        finally:
+            self._recovering = False
 
     def _backdrive_loop(self):
         self.get_logger().info('역구동 루프 시작 (중력보상 토크 스트리밍)')
