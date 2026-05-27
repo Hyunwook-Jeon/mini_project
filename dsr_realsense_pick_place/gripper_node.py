@@ -317,13 +317,28 @@ class GripperNode(Node):
         ok, _ = self._move(stroke, current or self.open_current)
         return ok
 
-    def destroy_node(self):
-        # 안전을 위해 노드가 파괴될 때 토크를 끕니다.
-        req = SetTorque.Request()
-        req.enabled = False
-        if self._cli_set_torque.service_is_ready():
-            self._cli_set_torque.call_async(req)
-        super().destroy_node()
+    def shutdown_safe(self, executor, timeout_sec: float = 2.0):
+        """종료 시 토크를 끈다(best-effort).
+
+        executor.spin()이 멈춘 뒤 destroy 직전에 호출되므로 call_async만으로는
+        요청이 전송되지 않는다(future를 처리할 spin이 없음). 넘겨받은 executor로
+        future를 직접 spin하여 동기적으로 전송한다.
+        """
+        try:
+            if not self._cli_set_torque.service_is_ready():
+                self.get_logger().warning('종료 — set_torque 서비스 미연결, 토크 OFF 생략')
+                return
+            req = SetTorque.Request()
+            req.enabled = False
+            future = self._cli_set_torque.call_async(req)
+            executor.spin_until_future_complete(future, timeout_sec=timeout_sec)
+            res = future.result() if future.done() else None
+            if res is not None and res.success:
+                self.get_logger().info('종료 — 토크 OFF 완료')
+            else:
+                self.get_logger().warning('종료 — 토크 OFF 응답 없음/실패(타임아웃)')
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warning(f'종료 토크 OFF 실패: {e}')
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -340,6 +355,7 @@ def main(args=None):
         pass
     finally:
         if node is not None and rclpy.ok():
+            node.shutdown_safe(executor)   # 종료 전 토크 OFF 동기 전송
             node.destroy_node()
             rclpy.shutdown()
 

@@ -76,12 +76,21 @@ object_detector:
 
 rh_p12_rna_gripper:
   ros__parameters:
-    robot_ns: "dsr01"      
-    stroke_close: 1000        
-    motion_wait: 1.5           
+    robot_ns: "dsr01"
     svc_timeout: 10.0
-    init_current: 400
-    cube_current: 300
+    state_hz: 20.0
+    # --- 그리퍼 동작 전류 (mA) — gripper_node가 실제로 읽는 이름 ---
+    open_current: 400           # 열기 전류 한계 (구 init_current)
+    close_current: 300          # 닫기/파지 전류 한계 (구 cube_current)
+    # --- 모터 속도/가속도 프로파일 ---
+    profile_velocity: 1500      # 구동 속도(레지스터 280). 너무 높이면 물체 접촉 시 과부하 위험
+    profile_acceleration: 1000  # 구동 가속도(레지스터 278)
+    # --- 스트로크 위치 (0=완전 열림, 1000=완전 닫힘) ---
+    stroke_open: 0
+    stroke_close: 1000
+    # --- 파지 감지 위치 범위 ---
+    min_grip_pos: 500           # 이 위치부터 파지 전류 감지 시작
+    max_grip_pos: 700           # 이 이상 = 물체 없음(완전 닫힘)
 
 pick_place_gui:
   ros__parameters:

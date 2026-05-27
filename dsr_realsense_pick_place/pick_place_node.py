@@ -158,6 +158,8 @@ class PickPlaceNode(Node):
         self.cli_movel         = self.create_client(MoveLine,      f'{prefix}/motion/move_line')
         self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
+        # 그리퍼 런타임 리셋(재초기화) — 에러 복구 시 그리퍼 stuck을 함께 푼다.
+        self.cli_gripper_reinit = self.create_client(Trigger, '/gripper_service/reinitialize')
 
         # robot_mode 서비스는 spin() 시작 전 __init__ 에서 미리 create_client
         from dsr_msgs2.srv import SetRobotMode
@@ -903,6 +905,18 @@ class PickPlaceNode(Node):
                                    timeout=5.0)
             except Exception as e:
                 self.get_logger().warn(f'서보 ON 요청 실패 (계속 진행): {e}')
+
+            # 2.5 그리퍼 재초기화 — 그리퍼가 에러/무응답(status 3)으로 stuck일 수 있으므로
+            #     열기 전에 먼저 복구한다(시리얼 recycle + 토크 재인가). 로봇 재부팅 불필요.
+            try:
+                if self.cli_gripper_reinit.service_is_ready():
+                    self.get_logger().info('그리퍼 재초기화 시도...')
+                    self._call_service(self.cli_gripper_reinit, Trigger.Request(),
+                                       "gripper_reinit", timeout=90.0)
+                else:
+                    self.get_logger().warn('그리퍼 reinit 서비스 미연결 (건너뜀)')
+            except Exception as e:
+                self.get_logger().warn(f'그리퍼 재초기화 실패 (계속 진행): {e}')
 
             # 3. 그리퍼 완전 Open
             try:

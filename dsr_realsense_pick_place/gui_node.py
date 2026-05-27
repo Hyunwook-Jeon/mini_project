@@ -90,7 +90,7 @@ from rcl_interfaces.msg import Parameter as RclParameter, ParameterType, Paramet
 from rcl_interfaces.srv import GetParameters, SetParameters
 from std_msgs.msg import Int32, String
 
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 from dsr_gripper_tcp_interfaces.msg import GripperState
 
 os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = QLibraryInfo.location(QLibraryInfo.PluginsPath)
@@ -234,6 +234,9 @@ class PickPlaceGuiNode(Node):
         self.cli_go_home       = self.create_client(Trigger, '/pick_place/go_home')
         self.cli_gripper_open  = self.create_client(Trigger, '/gripper/open')
         self.cli_gripper_close = self.create_client(Trigger, '/gripper/close')
+        # 그리퍼 런타임 리셋(재초기화) 및 토크 on/off
+        self.cli_gripper_reinit = self.create_client(Trigger, '/gripper_service/reinitialize')
+        self.cli_gripper_enable = self.create_client(SetBool, '/gripper/enable')
         self.cli_recover_to_home = self.create_client(Trigger, '/pick_place/recover_to_home')
         self.cli_e_stop        = self.create_client(Trigger, '/pick_place/e_stop')
         self.cli_cancel        = self.create_client(Trigger, '/pick_place/cancel')
@@ -975,10 +978,27 @@ class PickPlaceGui(QWidget):
         self.gripper_close_button.setMinimumHeight(32)
         self.gripper_close_button.clicked.connect(self._gripper_close)
 
+        # 그리퍼 런타임 리셋(재초기화) — 로봇 상태와 무관하게 단독 동작.
+        # 그리퍼가 에러/무응답(status 3)으로 멈췄을 때 로봇 재부팅 없이 복구 시도.
+        self.gripper_reset_button = QPushButton('그리퍼 리셋 (재초기화)')
+        self.gripper_reset_button.setMinimumHeight(32)
+        self.gripper_reset_button.clicked.connect(self._gripper_reset)
+
+        self.gripper_torque_on_button = QPushButton('토크 ON')
+        self.gripper_torque_on_button.setMinimumHeight(32)
+        self.gripper_torque_on_button.clicked.connect(self._gripper_torque_on)
+
+        self.gripper_torque_off_button = QPushButton('토크 OFF')
+        self.gripper_torque_off_button.setMinimumHeight(32)
+        self.gripper_torque_off_button.clicked.connect(self._gripper_torque_off)
+
         control_grid.addWidget(self.home_button, 0, 0)
         control_grid.addWidget(self.recover_home_button, 0, 1)
         control_grid.addWidget(self.gripper_open_button, 1, 0)
         control_grid.addWidget(self.gripper_close_button, 1, 1)
+        control_grid.addWidget(self.gripper_reset_button, 2, 0, 1, 2)
+        control_grid.addWidget(self.gripper_torque_on_button, 3, 0)
+        control_grid.addWidget(self.gripper_torque_off_button, 3, 1)
 
         # ── 그리퍼 정밀 전류 및 속도/가속도 제어 패널 ───────────────────────
         self.gripper_ctrl_group = QGroupBox('그리퍼 정밀 전류 제어')
@@ -1311,6 +1331,52 @@ class PickPlaceGui(QWidget):
             wait_for_state=False,
             min_busy_sec=self._gripper_feedback_hold_sec,
         )
+
+    def _gripper_reset(self):
+        # 로봇 상태와 무관한 그리퍼 단독 리셋(재초기화). 재초기화는 DRL 재시작 +
+        # 시리얼 recycle을 포함해 최대 수십 초 걸릴 수 있어 타임아웃을 길게 잡는다.
+        self._call_manual_command(
+            key='gripper_reset',
+            client=self.ros_node.cli_gripper_reinit,
+            service_label='gripper_service/reinitialize',
+            progress_text='그리퍼 리셋(재초기화) 중...',
+            done_text='그리퍼 리셋 완료',
+            timeout_sec=90.0,
+            wait_for_state=False,
+        )
+
+    def _gripper_torque_on(self):
+        self._call_gripper_torque(True)
+
+    def _gripper_torque_off(self):
+        self._call_gripper_torque(False)
+
+    def _call_gripper_torque(self, enable: bool):
+        """/gripper/enable(SetBool)로 토크 on/off. _call_manual_command는 Trigger
+        전용이라 SetBool은 직접 호출한다."""
+        label = '토크 ON' if enable else '토크 OFF'
+        client = self.ros_node.cli_gripper_enable
+        if not client.service_is_ready():
+            self.ros_node.get_logger().warn('서비스 미연결: gripper/enable')
+            self._set_manual_feedback(f'{label} 실패: 서비스 미연결')
+            return
+        self._set_manual_feedback(f'{label} 중...')
+        req = SetBool.Request()
+        req.data = bool(enable)
+        future = client.call_async(req)
+
+        def _done(f):
+            try:
+                res = f.result()
+                if res.success:
+                    self._set_manual_feedback(f'{label} 완료')
+                else:
+                    self._set_manual_feedback(f'{label} 거절: {res.message}')
+            except Exception as e:
+                self.ros_node.get_logger().error(f'gripper/enable 호출 실패: {e}')
+                self._set_manual_feedback(f'{label} 실패')
+
+        future.add_done_callback(_done)
 
     def _gripper_apply(self):
         # 중복 클릭 방지: 이전 요청이 완료되기 전에는 재진입 불가
