@@ -34,6 +34,8 @@ Qt-ROS 이벤트 루프 통합:
 
 import os
 import json
+import re
+import yaml
 import subprocess
 import sys
 import math
@@ -66,6 +68,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -111,8 +114,9 @@ class RealTimeGraphWidget(QWidget):
         self.data.append(float(value))
         if len(self.data) > self.max_len:
             self.data.pop(0)
-        current_max = max(self.data) if self.data else 0.0
-        self.max_value = max(100.0, current_max * 1.2)
+        # 0 중심 양방향 표시 — |max| 기준 대칭 스케일
+        abs_max = max(abs(v) for v in self.data) if self.data else 0.0
+        self.max_value = max(100.0, abs_max * 1.2)
         self.update()
 
     def paintEvent(self, event):
@@ -121,61 +125,66 @@ class RealTimeGraphWidget(QWidget):
 
         width = self.width()
         height = self.height()
-        
+        mid_y = height / 2.0
+
         # 다크 테마 배경 칠하기
         painter.fillRect(0, 0, width, height, QColor(30, 30, 30))
 
-        # 회색 격자선 그리기
+        # 회색 격자선 그리기 (0 중심 기준 ±25%, ±50%, ±75%)
         grid_pen = QPen(QColor(60, 60, 60), 1, Qt.DashLine)
         painter.setPen(grid_pen)
-        for i in range(1, 4):
-            y = int(height * i / 4)
+        for frac in (-0.75, -0.5, -0.25, 0.25, 0.5, 0.75):
+            y = int(mid_y - frac * mid_y)
             painter.drawLine(0, y, width, y)
         for i in range(1, 10):
             x = int(width * i / 10)
             painter.drawLine(x, 0, x, height)
 
-        # 실시간 플롯 라인 그리기 (최고점 기준 10% 단위 초록-노랑-빨강 그라데이션)
+        # 0 기준선 — 격자보다 진하게
+        zero_pen = QPen(QColor(120, 120, 120), 1, Qt.SolidLine)
+        painter.setPen(zero_pen)
+        painter.drawLine(0, int(mid_y), width, int(mid_y))
+
+        # 실시간 플롯 라인 (값 부호+크기 기반: +는 붉은 계열, -는 파란 계열, 0 근처는 회색)
         if len(self.data) >= 2:
             x_step = width / (self.max_len - 1)
             for i in range(len(self.data) - 1):
                 val = self.data[i+1]
                 t = val / self.max_value
-                t = max(0.0, min(1.0, t))
-                # 10% 단위로 끊기
-                t_discrete = round(t * 10) / 10.0
-
-                if t_discrete <= 0.5:
-                    # 초록 (0, 255, 0) -> 노랑 (255, 255, 0)
-                    r = int(t_discrete * 2.0 * 255)
-                    g = 255
-                    b = 0
+                t = max(-1.0, min(1.0, t))
+                mag = abs(t)
+                if t >= 0:
+                    # 회색(180,180,180) → 붉은색(255,60,60)
+                    r = int(180 + (255 - 180) * mag)
+                    g = int(180 + (60  - 180) * mag)
+                    b = int(180 + (60  - 180) * mag)
                 else:
-                    # 노랑 (255, 255, 0) -> 빨강 (255, 0, 0)
-                    r = 255
-                    g = int((1.0 - (t_discrete - 0.5) * 2.0) * 255)
-                    b = 0
+                    # 회색(180,180,180) → 파란색(60,120,255)
+                    r = int(180 + (60  - 180) * mag)
+                    g = int(180 + (120 - 180) * mag)
+                    b = int(180 + (255 - 180) * mag)
 
                 color = QColor(r, g, b)
                 line_pen = QPen(color, 2, Qt.SolidLine)
                 painter.setPen(line_pen)
 
                 x1 = i * x_step
-                y1 = height - (self.data[i] / self.max_value) * height
+                y1 = mid_y - (self.data[i]   / self.max_value) * mid_y
                 x2 = (i + 1) * x_step
-                y2 = height - (self.data[i+1] / self.max_value) * height
+                y2 = mid_y - (self.data[i+1] / self.max_value) * mid_y
 
                 y1 = max(0.0, min(float(height), y1))
                 y2 = max(0.0, min(float(height), y2))
 
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
-        # 우상단에 텍스트 표시
+        # 우상단에 텍스트 표시 (부호 같이 표시)
         text_pen = QPen(QColor(255, 255, 255))
         painter.setPen(text_pen)
         painter.setFont(QFont('Arial', 9, QFont.Bold))
-        curr_val = self.data[-1]
-        painter.drawText(10, 20, f'Current: {curr_val:.0f} mA')
+        if self.data:
+            curr_val = self.data[-1]
+            painter.drawText(10, 20, f'Current: {curr_val:+.0f} mA')
 
 
 class PickPlaceGuiNode(Node):
@@ -204,6 +213,25 @@ class PickPlaceGuiNode(Node):
         self.declare_parameter('calib_dx_mm', -20.0)
         self.declare_parameter('calib_dy_mm', -20.0)
         self.declare_parameter('calib_dz_mm', 140.0)
+
+        # 도달 가능 영역 필터 — 이 범위 밖 검출 물체는 GUI에서 버튼·요약 자체를 숨긴다.
+        # 사용자가 NOT REACHABLE 좌표를 클릭해 ERROR로 가는 것을 원천 차단.
+        # 기본값은 pick_place_node의 workspace_* 와 동일하게 두고, yaml로 좁힐 수 있음.
+        # reach_radius_max는 박스 한계와 별개로 sqrt(x^2+y^2)에 적용 — E0509 실제 운동학 한계 반영.
+        self.declare_parameter('workspace_x_min', 0.15)
+        self.declare_parameter('workspace_x_max', 0.80)
+        self.declare_parameter('workspace_y_min', -0.60)
+        self.declare_parameter('workspace_y_max', 0.60)
+        self.declare_parameter('workspace_z_min', 0.0)
+        self.declare_parameter('workspace_z_max', 0.60)
+        self.declare_parameter('reach_radius_max', 0.65)
+        self.workspace_x_min = float(self.get_parameter('workspace_x_min').value)
+        self.workspace_x_max = float(self.get_parameter('workspace_x_max').value)
+        self.workspace_y_min = float(self.get_parameter('workspace_y_min').value)
+        self.workspace_y_max = float(self.get_parameter('workspace_y_max').value)
+        self.workspace_z_min = float(self.get_parameter('workspace_z_min').value)
+        self.workspace_z_max = float(self.get_parameter('workspace_z_max').value)
+        self.reach_radius_max = float(self.get_parameter('reach_radius_max').value)
 
         # ROS 토픽으로 받은 영상/검출 결과를 Qt 위젯에서 바로 쓸 수 있게
         # 화면 표시용 상태를 멤버 변수로 유지한다.
@@ -239,6 +267,8 @@ class PickPlaceGuiNode(Node):
         self.cli_gripper_reinit = self.create_client(Trigger, '/gripper_service/reinitialize')
         self.cli_gripper_enable = self.create_client(SetBool, '/gripper/enable')
         self.cli_recover_to_home = self.create_client(Trigger, '/pick_place/recover_to_home')
+        # 로봇 이동 없이 ERROR 상태만 해제 (알람 리셋 + 그리퍼 reinit) — recover_to_home의 가벼운 변형.
+        self.cli_clear_error     = self.create_client(Trigger, '/pick_place/clear_error')
         self.cli_e_stop        = self.create_client(Trigger, '/pick_place/e_stop')
         self.cli_cancel        = self.create_client(Trigger, '/pick_place/cancel')
         self.cli_e_stop_reset  = self.create_client(Trigger, '/pick_place/e_stop_reset')
@@ -255,6 +285,11 @@ class PickPlaceGuiNode(Node):
         self.cli_gripper_get_parameters = self.create_client(GetParameters, '/rh_p12_rna_gripper/get_parameters')
         self.cli_gripper_set_parameters = self.create_client(SetParameters, '/rh_p12_rna_gripper/set_parameters')
 
+        # 물체별 파지 강도(grip_*)는 pick_place_node 파라미터로 라이브 적용한다.
+        self.cli_pickplace_set_parameters = self.create_client(SetParameters, '/pick_place_node/set_parameters')
+        # RealSense 카메라(노출 등) 파라미터 라이브 변경 — 운전 탭의 노출 슬라이더가 호출.
+        self.cli_camera_set_parameters = self.create_client(SetParameters, '/camera/camera/set_parameters')
+
         # 로봇 하드웨어 상태 / 속도 모드 (pick_place_node 폴링 결과 수신)
         self.hw_state   = -1   # -1 = unknown
         self.speed_mode = 0    # 0 = NORMAL
@@ -269,6 +304,11 @@ class PickPlaceGuiNode(Node):
         # 실시간 그리퍼 상태 수신 구독 (기존 토픽 및 브릿지 노드용 토픽 모두 수신 가능하도록 다중 등록)
         self.create_subscription(JointState, '/gripper/state', self._cb_gripper_joint_state, 10)
         self.create_subscription(JointState, '/gripper_service/joint_state', self._cb_gripper_joint_state, 10)
+        # 그리퍼 INIT/REINIT 진행 상황 — 시간이 카운트되면 진행 중, 멈춰있으면 막힘.
+        self.gripper_init_progress = ''       # 최근 메시지
+        self.gripper_init_progress_t = 0.0    # 마지막 수신 시각 (GUI에서 stale 판정)
+        self.create_subscription(String, '/gripper_service/init_progress',
+                                  self._cb_gripper_init_progress, 10)
 
         if self.use_local_yolo:
             self._init_local_yolo()
@@ -690,6 +730,11 @@ class PickPlaceGuiNode(Node):
     def _cb_gripper_service_state(self, msg: GripperState):
         self.gripper_hw_ready = msg.ready
 
+    def _cb_gripper_init_progress(self, msg: String):
+        # 그리퍼 INIT/REINIT 진행 — 메시지 수신 시각도 같이 저장(GUI에서 "stale" 판정용)
+        self.gripper_init_progress = msg.data.strip()
+        self.gripper_init_progress_t = time.monotonic()
+
     def _cb_hw_state(self, msg: Int32):
         self.hw_state = msg.data
         self.last_hw_state_time = time.monotonic()
@@ -774,6 +819,8 @@ class PickPlaceGui(QWidget):
         self._system_restart_proc = None # 재시작 launch 프로세스
         self._system_reset_phase = ''    # '' | 'shutting_down' | 'waiting' | 'restarting'
         self._system_reset_phase_until = 0.0
+        self._gripper_bridge_restart_proc = None   # restart_gripper_bridge.sh 프로세스
+        self._gripper_bridge_restart_until = 0.0   # 이 시각까지 버튼 비활성(재기동 진행 표시)
 
         # 좌측은 카메라 영상, 우측은 상태/선택 패널로 나누어 배치한다.
         self.setWindowTitle('DSR RealSense Pick & Place GUI')
@@ -785,16 +832,25 @@ class PickPlaceGui(QWidget):
         root = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
+        # 가장 넓은 탭(모델·캘리브)이 전체 창 폭을 끌어올리는 것 차단.
+        # 각 탭 안 위젯은 QSizePolicy에 따라 이 폭에 맞춰 압축됨(스크롤 영역이 흡수).
+        self.tabs.setMaximumWidth(440)
 
-        # 탭1 "운전": 좌(상태/카메라) + 우(긴급 제어/물체 선택)
+        # 탭1 "운전": 카메라(본문 좌측 고정) + 우측 단일 컬럼(긴급제어/상태/물체선택/실시간전류)
         _tab_op = QWidget()
-        _op_row = QHBoxLayout(_tab_op)
-        op_left = QVBoxLayout()
-        op_right = QVBoxLayout()
-        _op_row.addLayout(op_left, 2)
-        _op_row.addLayout(op_right, 1)
+        op_right = QVBoxLayout(_tab_op)
 
-        # 탭2 "수동·설정": 수동 제어/그리퍼 파라미터/안전/모델·캘리브 (스크롤)
+        # 탭2 "gripper": 그리퍼 동작/정밀 전류/물체별 강도 (스크롤)
+        _tab_grip = QWidget()
+        _grip_outer = QVBoxLayout(_tab_grip)
+        _grip_scroll = QScrollArea()
+        _grip_scroll.setWidgetResizable(True)
+        _grip_content = QWidget()
+        grip_col = QVBoxLayout(_grip_content)
+        _grip_scroll.setWidget(_grip_content)
+        _grip_outer.addWidget(_grip_scroll)
+
+        # 탭3 "수동·설정": 로봇 수동 제어/안전/모델·캘리브 (스크롤)
         _tab_set = QWidget()
         _set_outer = QVBoxLayout(_tab_set)
         _set_scroll = QScrollArea()
@@ -804,7 +860,7 @@ class PickPlaceGui(QWidget):
         _set_scroll.setWidget(_set_content)
         _set_outer.addWidget(_set_scroll)
 
-        # left_box는 호환을 위해 유지하지 않는다 — 각 그룹은 op_left/op_right/set_col에 직접 추가
+        # 각 그룹은 op_right(운전)/grip_col(gripper)/set_col(수동·설정)에 직접 추가한다
         self.system_status_labels = {}
         self.system_status_bar = QWidget()
         self.system_status_bar.setFixedSize(276, 24)
@@ -823,9 +879,11 @@ class PickPlaceGui(QWidget):
             status_bar_layout.addWidget(label)
         root.addWidget(self.system_status_bar, 0, Qt.AlignLeft)
 
-        # 상태 그룹박스 (좌측 상단으로 이동 및 가로 콤팩트 정렬)
+        # 상태 그룹박스 — 카메라와 그래프 사이(cam_col)에 배치. 카메라 폭에 맞춰 클램프.
         status_group = QGroupBox('상태')
         status_group.setMaximumHeight(54)
+        # 내부 라벨들이 길어 cam_col 폭을 키우는 것을 방지(전체 창이 같이 넓어짐).
+        status_group.setMaximumWidth(640)
         status_layout = QHBoxLayout(status_group)
         status_layout.setContentsMargins(8, 2, 8, 2)
         status_layout.setSpacing(12)
@@ -835,14 +893,20 @@ class PickPlaceGui(QWidget):
         self.selection_status_label = QLabel('선택 상태: 자동으로 가장 가까운 물체를 사용')
         self.command_status_label = QLabel('')
         self.command_status_label.setStyleSheet('color: #b0b0b0; font-weight: bold;')
+        # 그리퍼 INIT/REINIT 진행 — 막힘과 진행 중 구분용. /gripper_service/init_progress 구독.
+        self.gripper_init_label = QLabel('그리퍼: 대기')
+        self.gripper_init_label.setStyleSheet(
+            'color: #aaa; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+            'background-color: #2a2a2a;'
+        )
 
         status_layout.addWidget(self.state_label)
         status_layout.addWidget(self.selection_label)
         status_layout.addWidget(self.selection_status_label)
         status_layout.addWidget(self.command_status_label)
+        status_layout.addWidget(self.gripper_init_label)
         status_layout.addStretch(1)
-
-        op_left.addWidget(status_group)
+        # status_group은 운전 탭 우측 컬럼(op_right)에서 긴급 제어 아래에 배치(아래 조립부)
 
         compact_settings_group = QGroupBox('모델 설정 / 수동 캘리브레이션')
         compact_settings_group.setMaximumHeight(108)
@@ -972,16 +1036,33 @@ class PickPlaceGui(QWidget):
         self.e_stop_reset_button.clicked.connect(self._e_stop_reset)
         self.e_stop_reset_button.setEnabled(False)
 
+        # 에러 해제 — ERROR 상태에서만 활성. 로봇 이동 없이 알람 리셋 + 그리퍼 reinit만.
+        self.clear_error_button = QPushButton('에러 해제')
+        self.clear_error_button.setMinimumHeight(38)
+        self.clear_error_button.setStyleSheet(
+            'QPushButton {'
+            '  background-color: #b58900; color: white;'
+            '  font-size: 13px; font-weight: bold; border-radius: 6px;'
+            '}'
+            'QPushButton:hover { background-color: #d6a000; }'
+            'QPushButton:pressed { background-color: #806000; }'
+            'QPushButton:disabled { background-color: #555; color: #999; }'
+        )
+        self.clear_error_button.clicked.connect(self._clear_error)
+        self.clear_error_button.setEnabled(False)
+
         emergency_layout.addWidget(self.e_stop_button)
         emergency_layout.addWidget(self.cancel_button)
+        emergency_layout.addWidget(self.clear_error_button)
         emergency_layout.addWidget(self.e_stop_reset_button)
 
 
 
-        control_group = QGroupBox('수동 제어')
-        control_grid = QGridLayout(control_group)
-        control_grid.setSpacing(6)
-        control_grid.setContentsMargins(8, 6, 8, 6)
+        # 로봇 수동 제어(HOME/복구) — 수동·설정 탭. 그리퍼 동작은 gripper 탭으로 분리.
+        robot_ctrl_group = QGroupBox('로봇 수동 제어')
+        robot_ctrl_grid = QGridLayout(robot_ctrl_group)
+        robot_ctrl_grid.setSpacing(6)
+        robot_ctrl_grid.setContentsMargins(8, 6, 8, 6)
 
         self.home_button = QPushButton('HOME 이동')
         self.home_button.setMinimumHeight(32)
@@ -990,6 +1071,15 @@ class PickPlaceGui(QWidget):
         self.recover_home_button = QPushButton('에러 복구 & HOME 복귀')
         self.recover_home_button.setMinimumHeight(32)
         self.recover_home_button.clicked.connect(self._recover_to_home)
+
+        robot_ctrl_grid.addWidget(self.home_button, 0, 0)
+        robot_ctrl_grid.addWidget(self.recover_home_button, 0, 1)
+
+        # 그리퍼 동작 버튼 — gripper 탭. open/close/리셋/토크.
+        gripper_action_group = QGroupBox('그리퍼 동작')
+        gripper_action_grid = QGridLayout(gripper_action_group)
+        gripper_action_grid.setSpacing(6)
+        gripper_action_grid.setContentsMargins(8, 6, 8, 6)
 
         self.gripper_open_button = QPushButton('그리퍼 OPEN')
         self.gripper_open_button.setMinimumHeight(32)
@@ -1013,13 +1103,11 @@ class PickPlaceGui(QWidget):
         self.gripper_torque_off_button.setMinimumHeight(32)
         self.gripper_torque_off_button.clicked.connect(self._gripper_torque_off)
 
-        control_grid.addWidget(self.home_button, 0, 0)
-        control_grid.addWidget(self.recover_home_button, 0, 1)
-        control_grid.addWidget(self.gripper_open_button, 1, 0)
-        control_grid.addWidget(self.gripper_close_button, 1, 1)
-        control_grid.addWidget(self.gripper_reset_button, 2, 0, 1, 2)
-        control_grid.addWidget(self.gripper_torque_on_button, 3, 0)
-        control_grid.addWidget(self.gripper_torque_off_button, 3, 1)
+        gripper_action_grid.addWidget(self.gripper_open_button, 0, 0)
+        gripper_action_grid.addWidget(self.gripper_close_button, 0, 1)
+        gripper_action_grid.addWidget(self.gripper_reset_button, 1, 0, 1, 2)
+        gripper_action_grid.addWidget(self.gripper_torque_on_button, 2, 0)
+        gripper_action_grid.addWidget(self.gripper_torque_off_button, 2, 1)
 
         # ── 그리퍼 정밀 전류 및 속도/가속도 제어 패널 ───────────────────────
         self.gripper_ctrl_group = QGroupBox('그리퍼 정밀 전류 제어')
@@ -1062,6 +1150,24 @@ class PickPlaceGui(QWidget):
         open_curr_row.addWidget(self.open_curr_slider)
         open_curr_row.addWidget(self.open_curr_spin)
         gripper_ctrl_layout.addLayout(open_curr_row)
+
+        # 이송 전류 (파지 후 들고 이동 시 — 낮으면 발열↓, 너무 낮으면 이송 중 낙하)
+        transport_curr_row = QHBoxLayout()
+        transport_curr_label = QLabel('이송 전류:')
+        transport_curr_label.setFixedWidth(64)
+        self.transport_curr_slider = QSlider(Qt.Horizontal)
+        self.transport_curr_slider.setRange(50, 800)
+        self.transport_curr_slider.setValue(150)
+        self.transport_curr_spin = QSpinBox()
+        self.transport_curr_spin.setRange(50, 800)
+        self.transport_curr_spin.setValue(150)
+        self.transport_curr_spin.setFixedWidth(54)
+        self.transport_curr_slider.valueChanged.connect(self.transport_curr_spin.setValue)
+        self.transport_curr_spin.valueChanged.connect(self.transport_curr_slider.setValue)
+        transport_curr_row.addWidget(transport_curr_label)
+        transport_curr_row.addWidget(self.transport_curr_slider)
+        transport_curr_row.addWidget(self.transport_curr_spin)
+        gripper_ctrl_layout.addLayout(transport_curr_row)
 
         # 속도
         vel_row = QHBoxLayout()
@@ -1125,6 +1231,87 @@ class PickPlaceGui(QWidget):
             'QPushButton:disabled { background-color: #444; color: #888; }'
         )
         gripper_ctrl_layout.addWidget(self.gripper_apply_button)
+
+        # 💾 yaml 저장 — GUI 튜닝을 파일에 영구 반영(yaml 공유로 다른 PC에서 동일 튜닝 재현)
+        self.gripper_save_button = QPushButton('💾 yaml 저장')
+        self.gripper_save_button.setMinimumHeight(28)
+        self.gripper_save_button.clicked.connect(self._gripper_ctrl_save)
+        self.gripper_save_button.setStyleSheet(
+            'QPushButton { background-color: #2a5a2a; color: white;'
+            '  font-weight: bold; border-radius: 5px; }'
+            'QPushButton:hover { background-color: #3a803a; }'
+        )
+        gripper_ctrl_layout.addWidget(self.gripper_save_button)
+
+        # ── 물체별 파지 강도 (gripper 탭) ───────────────────────────────
+        # config(pick_place_params.yaml)에서 클래스↔전류를 읽어 슬라이더 행을 동적 생성.
+        # [적용] → pick_place_node 파라미터 라이브 설정, [저장] → yaml 파일 갱신.
+        names, currents, default, cmin, cmax = self._load_grip_strength_config()
+        self._grip_cmin, self._grip_cmax = cmin, cmax
+        self.grip_strength_group = QGroupBox('물체별 파지 강도 (mA)')
+        grip_strength_layout = QVBoxLayout(self.grip_strength_group)
+        grip_strength_layout.setContentsMargins(8, 6, 8, 6)
+        grip_strength_layout.setSpacing(4)
+
+        info_label = QLabel('낮을수록 약하게 파지. 미인식/맵에 없는 물체는 "기본값" 사용.')
+        info_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        info_label.setWordWrap(True)
+        grip_strength_layout.addWidget(info_label)
+
+        # class명 → (slider, spin). 기본값 행은 '__default__' 키로 보관.
+        self._grip_strength_rows = {}
+
+        def _make_curr_row(caption: str, value: int):
+            row = QHBoxLayout()
+            lab = QLabel(caption)
+            lab.setFixedWidth(72)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(cmin, cmax)
+            slider.setValue(int(value))
+            spin = QSpinBox()
+            spin.setRange(cmin, cmax)
+            spin.setValue(int(value))
+            spin.setFixedWidth(56)
+            slider.valueChanged.connect(spin.setValue)
+            spin.valueChanged.connect(slider.setValue)
+            row.addWidget(lab)
+            row.addWidget(slider)
+            row.addWidget(spin)
+            grip_strength_layout.addLayout(row)
+            return slider, spin
+
+        for _n, _c in zip(names, currents):
+            self._grip_strength_rows[_n] = _make_curr_row(_n, _c)
+        # 미인식 기본값 행
+        self._grip_strength_rows['__default__'] = _make_curr_row('미인식 기본', default)
+
+        grip_btn_row = QHBoxLayout()
+        self.grip_strength_apply_button = QPushButton('물체별 강도 적용')
+        self.grip_strength_apply_button.setMinimumHeight(30)
+        self.grip_strength_apply_button.clicked.connect(self._grip_strength_apply)
+        self.grip_strength_apply_button.setStyleSheet(
+            'QPushButton { background-color: #2a2a5a; color: white;'
+            '  font-weight: bold; border-radius: 5px; }'
+            'QPushButton:hover { background-color: #3a3a80; }'
+            'QPushButton:disabled { background-color: #444; color: #888; }'
+        )
+        self.grip_strength_save_button = QPushButton('💾 파일 저장')
+        self.grip_strength_save_button.setMinimumHeight(30)
+        self.grip_strength_save_button.clicked.connect(self._grip_strength_save)
+        self.grip_strength_save_button.setStyleSheet(
+            'QPushButton { background-color: #2a4a2a; color: white;'
+            '  font-weight: bold; border-radius: 5px; }'
+            'QPushButton:hover { background-color: #3a6a3a; }'
+            'QPushButton:disabled { background-color: #444; color: #888; }'
+        )
+        grip_btn_row.addWidget(self.grip_strength_apply_button)
+        grip_btn_row.addWidget(self.grip_strength_save_button)
+        grip_strength_layout.addLayout(grip_btn_row)
+
+        self.grip_strength_status_label = QLabel('')
+        self.grip_strength_status_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        self.grip_strength_status_label.setWordWrap(True)
+        grip_strength_layout.addWidget(self.grip_strength_status_label)
 
 
         # ── 시스템 안전 및 동작 모드 (기존 안전 모드 및 Doosan 안전 모드 통합) ──
@@ -1272,6 +1459,151 @@ class PickPlaceGui(QWidget):
         self.system_reset_label.setAlignment(Qt.AlignCenter)
         safety_layout.addWidget(self.system_reset_label)
 
+        # ── 그리퍼 브릿지 재시작 (status3 가벼운 복구) ─────────────────
+        # 그리퍼 status3(Modbus 무응답)가 "그리퍼 리셋"(in-process reinit)으로 안 풀릴 때,
+        # 브릿지 노드만 새 프로세스로 재기동해 ~5초 복구한다. 로봇/카메라는 안 건드림.
+        self.gripper_bridge_restart_button = QPushButton('🔧  그리퍼 브릿지 재시작 (status3 복구)')
+        self.gripper_bridge_restart_button.setMinimumHeight(34)
+        self.gripper_bridge_restart_button.setToolTip(
+            '그리퍼 브릿지(gripper_service_node + gripper_node)만 새 프로세스로 재기동합니다.\n'
+            '"그리퍼 리셋"으로 안 풀리는 status3(Modbus 무응답) 복구용 — 전원 사이클 불필요.')
+        self.gripper_bridge_restart_button.setStyleSheet(
+            'QPushButton { background-color: #4a3000; color: white;'
+            '  font-weight: bold; border-radius: 5px; }'
+            'QPushButton:hover { background-color: #7a5000; }'
+            'QPushButton:disabled { background-color: #444; color: #888; }'
+        )
+        self.gripper_bridge_restart_button.clicked.connect(self._gripper_bridge_restart)
+        safety_layout.addWidget(self.gripper_bridge_restart_button)
+
+        self.gripper_bridge_restart_label = QLabel('')
+        self.gripper_bridge_restart_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        self.gripper_bridge_restart_label.setAlignment(Qt.AlignCenter)
+        safety_layout.addWidget(self.gripper_bridge_restart_label)
+
+        # ── TCP Z 절대 하한 (min_safe_z) ───────────────────────────────
+        # pick_place_node가 모든 직교 이동에서 이 높이(base_link 기준, m) 아래로
+        # 못 내려가게 클램프한다. [적용]=라이브 set_parameters, [저장]=yaml 영구 반영.
+        zfloor_divider = QFrame()
+        zfloor_divider.setFrameShape(QFrame.HLine)
+        zfloor_divider.setFrameShadow(QFrame.Sunken)
+        zfloor_divider.setStyleSheet('background-color: #444;')
+        safety_layout.addWidget(zfloor_divider)
+
+        zfloor_caption = QLabel('TCP Z 안전 하한 (m)')
+        zfloor_caption.setStyleSheet('font-weight: bold; color: #ddd;')
+        safety_layout.addWidget(zfloor_caption)
+
+        zfloor_info = QLabel('이 높이 아래로는 로봇이 내려가지 않음. 테이블/지그 높이로 설정해 충돌 방지.')
+        zfloor_info.setStyleSheet('color: #aaa; font-size: 11px;')
+        zfloor_info.setWordWrap(True)
+        safety_layout.addWidget(zfloor_info)
+
+        zfloor_row = QHBoxLayout()
+        zfloor_label = QLabel('하한 Z:')
+        zfloor_label.setFixedWidth(56)
+        self.min_safe_z_spin = QDoubleSpinBox()
+        self.min_safe_z_spin.setRange(0.0, 0.60)
+        self.min_safe_z_spin.setSingleStep(0.005)
+        self.min_safe_z_spin.setDecimals(3)
+        self.min_safe_z_spin.setValue(self._load_min_safe_z())
+        self.min_safe_z_spin.setFixedWidth(80)
+        self.min_safe_z_apply_button = QPushButton('적용')
+        self.min_safe_z_apply_button.setFixedSize(48, 26)
+        self.min_safe_z_apply_button.clicked.connect(self._min_safe_z_apply)
+        self.min_safe_z_save_button = QPushButton('💾 저장')
+        self.min_safe_z_save_button.setFixedSize(64, 26)
+        self.min_safe_z_save_button.clicked.connect(self._min_safe_z_save)
+        zfloor_row.addWidget(zfloor_label)
+        zfloor_row.addWidget(self.min_safe_z_spin)
+        zfloor_row.addStretch(1)
+        zfloor_row.addWidget(self.min_safe_z_apply_button)
+        zfloor_row.addWidget(self.min_safe_z_save_button)
+        safety_layout.addLayout(zfloor_row)
+
+        self.min_safe_z_status_label = QLabel('')
+        self.min_safe_z_status_label.setStyleSheet('color: #aaa; font-size: 11px;')
+        self.min_safe_z_status_label.setWordWrap(True)
+        safety_layout.addWidget(self.min_safe_z_status_label)
+
+        # ── 검출 임계 / 카메라 노출 조정 (운전 탭, 물체 선택 위) ─────────
+        # confidence는 object_detector의 conf_thresh를 라이브 변경.
+        # 노출은 RealSense rgb_camera 파라미터를 라이브 변경 (auto OFF 후 수동 값 설정).
+        detect_tune_group = QGroupBox('검출/노출 조정')
+        detect_tune_layout = QVBoxLayout(detect_tune_group)
+        detect_tune_layout.setContentsMargins(8, 6, 8, 6)
+        detect_tune_layout.setSpacing(4)
+
+        # 신뢰도 임계 행
+        conf_row = QHBoxLayout()
+        conf_label = QLabel('신뢰도:')
+        conf_label.setFixedWidth(56)
+        # QDoubleSpinBox로 0.05~0.95 (0.01 step). 슬라이더는 정수만 가능해 100배 스케일.
+        self.conf_thresh_slider = QSlider(Qt.Horizontal)
+        self.conf_thresh_slider.setRange(5, 95)
+        self.conf_thresh_slider.setValue(50)
+        self.conf_thresh_spin = QDoubleSpinBox()
+        self.conf_thresh_spin.setRange(0.05, 0.95)
+        self.conf_thresh_spin.setSingleStep(0.05)
+        self.conf_thresh_spin.setDecimals(2)
+        self.conf_thresh_spin.setValue(0.50)
+        self.conf_thresh_spin.setFixedWidth(64)
+        # 슬라이더 ↔ 스핀 양방향 동기화 (스케일 변환)
+        self.conf_thresh_slider.valueChanged.connect(
+            lambda v: self.conf_thresh_spin.setValue(v / 100.0))
+        self.conf_thresh_spin.valueChanged.connect(
+            lambda v: self.conf_thresh_slider.setValue(int(round(v * 100))))
+        self.conf_apply_button = QPushButton('적용')
+        self.conf_apply_button.setFixedSize(48, 24)
+        self.conf_apply_button.clicked.connect(self._confidence_apply)
+        conf_row.addWidget(conf_label)
+        conf_row.addWidget(self.conf_thresh_slider)
+        conf_row.addWidget(self.conf_thresh_spin)
+        conf_row.addWidget(self.conf_apply_button)
+        detect_tune_layout.addLayout(conf_row)
+
+        # 자동노출 토글
+        auto_exp_row = QHBoxLayout()
+        auto_exp_label = QLabel('자동노출:')
+        auto_exp_label.setFixedWidth(56)
+        self.auto_exposure_check = QCheckBox('ON')
+        self.auto_exposure_check.setChecked(True)
+        # 토글 시 즉시 적용 (set_parameters 호출). 매번 [적용] 버튼 없이 켜고 끄기 직관적.
+        self.auto_exposure_check.stateChanged.connect(self._exposure_auto_toggle)
+        auto_exp_row.addWidget(auto_exp_label)
+        auto_exp_row.addWidget(self.auto_exposure_check)
+        auto_exp_row.addStretch(1)
+        detect_tune_layout.addLayout(auto_exp_row)
+
+        # 수동 노출 행 (자동노출 OFF일 때만 활성)
+        exp_row = QHBoxLayout()
+        exp_label = QLabel('수동노출:')
+        exp_label.setFixedWidth(56)
+        self.exposure_slider = QSlider(Qt.Horizontal)
+        self.exposure_slider.setRange(20, 5000)    # μs 단위. RealSense 일반 범위
+        self.exposure_slider.setValue(80)
+        self.exposure_spin = QSpinBox()
+        self.exposure_spin.setRange(20, 5000)
+        self.exposure_spin.setValue(80)
+        self.exposure_spin.setSuffix(' μs')
+        self.exposure_spin.setFixedWidth(80)
+        self.exposure_slider.valueChanged.connect(self.exposure_spin.setValue)
+        self.exposure_spin.valueChanged.connect(self.exposure_slider.setValue)
+        self.exposure_apply_button = QPushButton('적용')
+        self.exposure_apply_button.setFixedSize(48, 24)
+        self.exposure_apply_button.clicked.connect(self._exposure_apply)
+        exp_row.addWidget(exp_label)
+        exp_row.addWidget(self.exposure_slider)
+        exp_row.addWidget(self.exposure_spin)
+        exp_row.addWidget(self.exposure_apply_button)
+        detect_tune_layout.addLayout(exp_row)
+
+        # 상태 라벨 (적용 결과 표시)
+        self.detect_tune_status = QLabel('')
+        self.detect_tune_status.setStyleSheet('color: #aaa; font-size: 11px;')
+        self.detect_tune_status.setWordWrap(True)
+        detect_tune_layout.addWidget(self.detect_tune_status)
+
         object_group = QGroupBox('검출된 물체 선택')
         object_layout = QVBoxLayout(object_group)
         self.auto_button = QPushButton('자동 선택 사용')
@@ -1289,27 +1621,37 @@ class PickPlaceGui(QWidget):
         self.object_summary.setWordWrap(True)
         object_layout.addWidget(self.object_summary)
 
-        # 탭1 "운전" 우측: 긴급 제어 + 물체 선택
+        # 탭1 "운전" 단일 컬럼: 긴급 제어 → 검출/노출 조정 → 물체 선택 → 실시간 전류
+        # (상태창은 카메라와 그래프 사이의 cam_col로 이동 — 모든 탭에서 상시 노출)
         op_right.addWidget(emergency_group)
+        op_right.addWidget(detect_tune_group)
         op_right.addWidget(object_group)
         # 검출 물체 선택 아래: 실시간 전류값 한 줄
         op_right.addWidget(self.gripper_status_label)
         op_right.addStretch(1)
 
-        # 탭2 "수동·설정": 수동 제어 + 그리퍼 파라미터 + 안전 모드 (+ 모델·캘리브은 위에서 추가됨)
-        set_col.addWidget(control_group)
-        set_col.addWidget(self.gripper_ctrl_group)
+        # 탭2 "gripper": 그리퍼 동작 + 정밀 전류 제어 + 물체별 강도
+        grip_col.addWidget(gripper_action_group)
+        grip_col.addWidget(self.gripper_ctrl_group)
+        grip_col.addWidget(self.grip_strength_group)
+        grip_col.addStretch(1)
+
+        # 탭3 "수동·설정": 로봇 수동 제어 + 안전 모드 (+ 모델·캘리브은 위에서 추가됨)
+        set_col.addWidget(robot_ctrl_group)
         set_col.addWidget(safety_group)
         set_col.addStretch(1)
 
         self.tabs.addTab(_tab_op, '운전')
+        self.tabs.addTab(_tab_grip, 'gripper')
         self.tabs.addTab(_tab_set, '수동·설정')
 
         # 카메라 영상은 어느 탭에서나 항상 보이도록 본문 좌측에 고정, 탭은 우측에 배치
         body = QHBoxLayout()
         cam_col = QVBoxLayout()
         cam_col.addWidget(self.image_label)
-        # 실시간 전류 그래프: 카메라 바로 아래, 모든 탭 상시(가로 길게)
+        # 상태창: 카메라와 그래프 사이 — 모든 탭에서 상시 노출
+        cam_col.addWidget(status_group)
+        # 실시간 전류 그래프: 상태 바로 아래, 모든 탭 상시(가로 길게)
         cam_col.addWidget(self.realtime_graph)
         body.addLayout(cam_col, 2)
         body.addWidget(self.tabs, 3)
@@ -1327,6 +1669,9 @@ class PickPlaceGui(QWidget):
     def _select_label(self, label: str):
         self.ros_node.publish_selected_label(label)
         if label:
+            # 그리퍼 미준비면 사전 안내 후에도 서비스는 그대로 호출 — pick_place_node가 reject하면 사용자에게 응답 메시지로 통지됨.
+            if not self.ros_node.gripper_hw_ready:
+                self.ros_node.get_logger().warn('그리퍼 준비 미완료 — run_once 요청은 거절될 수 있습니다.')
             self.ros_node.call_trigger_service(self.ros_node.cli_run_once, 'pick_place/run_once')
 
     def _recover_to_home(self):
@@ -1438,6 +1783,7 @@ class PickPlaceGui(QWidget):
         params = [
             ('open_current', ParameterType.PARAMETER_INTEGER, int(self.open_curr_spin.value())),
             ('close_current', ParameterType.PARAMETER_INTEGER, int(self.close_curr_spin.value())),
+            ('transport_current', ParameterType.PARAMETER_INTEGER, int(self.transport_curr_spin.value())),
             ('profile_velocity', ParameterType.PARAMETER_INTEGER, int(self.vel_spin.value())),
             ('profile_acceleration', ParameterType.PARAMETER_INTEGER, int(self.acc_spin.value()))
         ]
@@ -1467,6 +1813,357 @@ class PickPlaceGui(QWidget):
         else:
             reason = next((r.reason for r in results if not r.successful), '')
             self.ros_node.get_logger().warn(f'그리퍼 파라미터 적용 거절: {reason}')
+
+    # ── 물체별 파지 강도 ────────────────────────────────────────────────
+    def _find_params_yaml(self) -> Path | None:
+        """config/pick_place_params.yaml 경로를 후보 루트에서 찾는다."""
+        rel = Path('config') / 'pick_place_params.yaml'
+        for root in self.ros_node._candidate_search_roots():
+            cand = root / rel
+            if cand.is_file():
+                return cand.resolve()
+        return None
+
+    def _load_grip_strength_config(self):
+        """yaml에서 (names, currents, default, min, max)를 읽는다.
+        실패 시 안전한 기본값으로 폴백한다."""
+        names = ['doll', 'cup', 'pencil', 'tape', 'pack']
+        currents = [250, 250, 200, 280, 350]
+        default, cmin, cmax = 300, 100, 500
+        path = self._find_params_yaml()
+        if path is None:
+            return names, currents, default, cmin, cmax
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+            pp = data.get('pick_place_node', {}).get('ros__parameters', {})
+            n = pp.get('grip_class_names', names)
+            c = pp.get('grip_class_currents', currents)
+            if isinstance(n, list) and isinstance(c, list) and len(n) == len(c) and n:
+                names = [str(x) for x in n]
+                currents = [int(x) for x in c]
+            default = int(pp.get('grip_current_default', default))
+            cmin = int(pp.get('grip_current_min', cmin))
+            cmax = int(pp.get('grip_current_max', cmax))
+        except Exception as e:
+            self.ros_node.get_logger().warn(f'grip 강도 config 읽기 실패(기본값 사용): {e}')
+        return names, currents, default, cmin, cmax
+
+    def _collect_grip_strength(self):
+        """현재 슬라이더 값을 (names, currents, default)로 모은다 (clamp 적용)."""
+        names, currents = [], []
+        for cls, (_slider, spin) in self._grip_strength_rows.items():
+            val = max(self._grip_cmin, min(self._grip_cmax, int(spin.value())))
+            if cls == '__default__':
+                default = val
+            else:
+                names.append(cls)
+                currents.append(val)
+        return names, currents, default
+
+    def _grip_strength_apply(self):
+        """슬라이더 값을 pick_place_node 파라미터로 라이브 적용하고,
+        detector의 known_classes도 같은 names로 동기화한다 (라벨↔강도 일관성)."""
+        cli = self.ros_node.cli_pickplace_set_parameters
+        if not cli.service_is_ready():
+            self.grip_strength_status_label.setText('⚠ pick_place set_parameters 서비스 미연결')
+            return
+        names, currents, default = self._collect_grip_strength()
+
+        req = SetParameters.Request()
+        # grip_class_names (STRING_ARRAY)
+        p_names = RclParameter()
+        p_names.name = 'grip_class_names'
+        p_names.value = ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY,
+                                       string_array_value=names)
+        # grip_class_currents (INTEGER_ARRAY)
+        p_curr = RclParameter()
+        p_curr.name = 'grip_class_currents'
+        p_curr.value = ParameterValue(type=ParameterType.PARAMETER_INTEGER_ARRAY,
+                                      integer_array_value=currents)
+        # grip_current_default (INTEGER)
+        p_def = RclParameter()
+        p_def.name = 'grip_current_default'
+        p_def.value = ParameterValue(type=ParameterType.PARAMETER_INTEGER,
+                                     integer_value=int(default))
+        req.parameters = [p_names, p_curr, p_def]
+
+        # 동시에 object_detector의 known_classes도 동일 names로 push (라벨 일관성 보장)
+        det_cli = self.ros_node.cli_object_set_parameters
+        if det_cli.service_is_ready():
+            det_req = SetParameters.Request()
+            p_known = RclParameter()
+            p_known.name = 'known_classes'
+            p_known.value = ParameterValue(type=ParameterType.PARAMETER_STRING_ARRAY,
+                                            string_array_value=names)
+            det_req.parameters = [p_known]
+            det_future = det_cli.call_async(det_req)
+            det_future.add_done_callback(self._on_known_classes_synced)
+        else:
+            self.ros_node.get_logger().warn(
+                '⚠ object_detector set_parameters 미연결 — known_classes 동기화 못 함. '
+                'detector 재시작 후 다음 launch 때 yaml에서 읽힘.')
+
+        future = cli.call_async(req)
+        future.add_done_callback(self._on_grip_strength_applied)
+        self.grip_strength_status_label.setText('적용 중...')
+
+    def _on_grip_strength_applied(self, future):
+        try:
+            results = future.result().results
+            ok = bool(results) and all(r.successful for r in results)
+        except Exception as e:
+            self.ros_node.get_logger().error(f'물체별 강도 적용 실패: {e}')
+            self.grip_strength_status_label.setText(f'⚠ 적용 실패: {e}')
+            return
+        if ok:
+            self.ros_node.get_logger().info('물체별 파지 강도 적용 완료.')
+            self.grip_strength_status_label.setText('✅ 적용 완료 (저장하지 않으면 재시작 시 초기화)')
+        else:
+            reason = next((r.reason for r in results if not r.successful), '')
+            self.ros_node.get_logger().warn(f'물체별 강도 적용 거절: {reason}')
+            self.grip_strength_status_label.setText(f'⚠ 거절: {reason}')
+
+    def _on_known_classes_synced(self, future):
+        """detector의 known_classes set_parameters 응답 처리(보조)."""
+        try:
+            results = future.result().results
+            ok = bool(results) and all(r.successful for r in results)
+        except Exception as e:
+            self.ros_node.get_logger().warn(f'⚠ detector known_classes 동기화 실패: {e}')
+            return
+        if ok:
+            self.ros_node.get_logger().info('object_detector.known_classes 동기화 완료.')
+        else:
+            reason = next((r.reason for r in results if not r.successful), '')
+            self.ros_node.get_logger().warn(f'⚠ detector known_classes 거절: {reason}')
+
+    def _grip_strength_save(self):
+        """현재 슬라이더 값을 yaml 파일의 해당 라인만 교체해 저장(주석 보존).
+        라벨↔강도 일관성을 위해 object_detector 섹션의 known_classes도 동시에 갱신."""
+        path = self._find_params_yaml()
+        if path is None:
+            self.grip_strength_status_label.setText('⚠ config yaml 파일을 찾지 못함')
+            return
+        names, currents, default = self._collect_grip_strength()
+        names_str = '[' + ', '.join(f'"{n}"' for n in names) + ']'
+        curr_str = '[' + ', '.join(str(c) for c in currents) + ']'
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+            # 들여쓰기를 보존하며 키 라인만 값 교체 (인라인 주석은 제거됨)
+            # known_classes도 같이 갱신 — 라벨↔강도 일관성 보장(단일 yaml 편집으로 둘 다 sync)
+            patterns = {
+                'grip_class_names': names_str,
+                'grip_class_currents': curr_str,
+                'grip_current_default': str(int(default)),
+                'known_classes': names_str,
+            }
+            replaced = {k: False for k in patterns}
+            for i, line in enumerate(lines):
+                for key, new_val in patterns.items():
+                    m = re.match(rf'^(\s*){key}\s*:', line)
+                    if m and not replaced[key]:
+                        lines[i] = f'{m.group(1)}{key}: {new_val}\n'
+                        replaced[key] = True
+            # known_classes는 옵셔널(이전 yaml에 없을 수 있음) → 누락 허용
+            optional = {'known_classes'}
+            missing = [k for k, v in replaced.items() if not v and k not in optional]
+            if missing:
+                self.grip_strength_status_label.setText(f'⚠ yaml에서 필수 키 누락: {missing}')
+                return
+            with open(path, 'w') as f:
+                f.writelines(lines)
+            extras = '' if replaced['known_classes'] else ' (known_classes 라인 없음 — 수동 추가 필요)'
+            self.ros_node.get_logger().info(f'물체별 파지 강도 yaml 저장: {path}{extras}')
+            self.grip_strength_status_label.setText(f'💾 저장 완료: {path.name}{extras}')
+        except Exception as e:
+            self.ros_node.get_logger().error(f'yaml 저장 실패: {e}')
+            self.grip_strength_status_label.setText(f'⚠ 저장 실패: {e}')
+
+    def _gripper_ctrl_save(self):
+        """그리퍼 정밀 전류/속도 슬라이더 값을 yaml 해당 라인만 교체해 저장(값만 바꾸고 주석 보존).
+        GUI 튜닝을 yaml에 영구 반영 → yaml 파일 공유로 다른 PC에서 동일 튜닝 재현."""
+        path = self._find_params_yaml()
+        if path is None:
+            self.ros_node.get_logger().warn('⚠ config yaml 파일을 찾지 못함 (그리퍼 전류 저장)')
+            return
+        patterns = {
+            'open_current': str(int(self.open_curr_spin.value())),
+            'close_current': str(int(self.close_curr_spin.value())),
+            'transport_current': str(int(self.transport_curr_spin.value())),
+            'profile_velocity': str(int(self.vel_spin.value())),
+            'profile_acceleration': str(int(self.acc_spin.value())),
+        }
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+            replaced = {k: False for k in patterns}
+            for i, line in enumerate(lines):
+                for key, new_val in patterns.items():
+                    # 값만 교체하고 인라인 주석(#...)은 보존
+                    m = re.match(rf'^(\s*){key}\s*:\s*[^#\n]*?(\s*#.*)?$', line)
+                    if m and not replaced[key]:
+                        comment = m.group(2) or ''
+                        lines[i] = f'{m.group(1)}{key}: {new_val}{comment}\n'
+                        replaced[key] = True
+            missing = [k for k, v in replaced.items() if not v]
+            if missing:
+                self.ros_node.get_logger().warn(f'⚠ 그리퍼 전류 yaml 저장 — 키 누락: {missing}')
+                return
+            with open(path, 'w') as f:
+                f.writelines(lines)
+            self.ros_node.get_logger().info(f'💾 그리퍼 전류/프로파일 yaml 저장 완료: {path}')
+        except Exception as e:
+            self.ros_node.get_logger().error(f'그리퍼 전류 yaml 저장 실패: {e}')
+
+    # ── TCP Z 안전 하한 (min_safe_z) ────────────────────────────────────
+    def _load_min_safe_z(self) -> float:
+        """yaml에서 pick_place_node.min_safe_z를 읽는다. 실패 시 0.0."""
+        path = self._find_params_yaml()
+        if path is None:
+            return 0.0
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+            pp = data.get('pick_place_node', {}).get('ros__parameters', {})
+            return float(pp.get('min_safe_z', 0.0))
+        except Exception as e:
+            self.ros_node.get_logger().warn(f'min_safe_z config 읽기 실패(0.0 사용): {e}')
+            return 0.0
+
+    def _min_safe_z_apply(self):
+        """스핀박스 값을 pick_place_node.min_safe_z로 라이브 적용."""
+        cli = self.ros_node.cli_pickplace_set_parameters
+        if not cli.service_is_ready():
+            self.min_safe_z_status_label.setText('⚠ pick_place set_parameters 서비스 미연결')
+            return
+        val = float(self.min_safe_z_spin.value())
+        req = SetParameters.Request()
+        p = RclParameter()
+        p.name = 'min_safe_z'
+        p.value = ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=val)
+        req.parameters = [p]
+        future = cli.call_async(req)
+        future.add_done_callback(self._on_min_safe_z_applied)
+        self.min_safe_z_status_label.setText('적용 중...')
+
+    def _on_min_safe_z_applied(self, future):
+        try:
+            results = future.result().results
+            ok = bool(results) and all(r.successful for r in results)
+        except Exception as e:
+            self.ros_node.get_logger().error(f'min_safe_z 적용 실패: {e}')
+            self.min_safe_z_status_label.setText(f'⚠ 적용 실패: {e}')
+            return
+        if ok:
+            self.ros_node.get_logger().info('TCP Z 안전 하한(min_safe_z) 적용 완료.')
+            self.min_safe_z_status_label.setText('✅ 적용 완료 (저장하지 않으면 재시작 시 초기화)')
+        else:
+            reason = next((r.reason for r in results if not r.successful), '')
+            self.ros_node.get_logger().warn(f'min_safe_z 적용 거절: {reason}')
+            self.min_safe_z_status_label.setText(f'⚠ 거절: {reason}')
+
+    def _min_safe_z_save(self):
+        """현재 스핀박스 값을 yaml의 min_safe_z 라인만 교체해 저장(주석 보존)."""
+        path = self._find_params_yaml()
+        if path is None:
+            self.min_safe_z_status_label.setText('⚠ config yaml 파일을 찾지 못함')
+            return
+        val = float(self.min_safe_z_spin.value())
+        try:
+            with open(path, 'r') as f:
+                lines = f.readlines()
+            replaced = False
+            for i, line in enumerate(lines):
+                m = re.match(r'^(\s*)min_safe_z\s*:', line)
+                if m:
+                    lines[i] = f'{m.group(1)}min_safe_z: {val:.3f}\n'
+                    replaced = True
+                    break
+            if not replaced:
+                self.min_safe_z_status_label.setText('⚠ yaml에서 min_safe_z 키를 찾지 못함')
+                return
+            with open(path, 'w') as f:
+                f.writelines(lines)
+            self.ros_node.get_logger().info(f'min_safe_z yaml 저장: {path} = {val:.3f}')
+            self.min_safe_z_status_label.setText(f'💾 저장 완료: {val:.3f} m')
+        except Exception as e:
+            self.ros_node.get_logger().error(f'min_safe_z yaml 저장 실패: {e}')
+            self.min_safe_z_status_label.setText(f'⚠ 저장 실패: {e}')
+
+    # ── 검출 임계 / 노출 (운전 탭) ───────────────────────────────────
+    def _confidence_apply(self):
+        """object_detector의 confidence_threshold를 라이브 변경."""
+        cli = self.ros_node.cli_object_set_parameters
+        if not cli.service_is_ready():
+            self.detect_tune_status.setText('⚠ object_detector set_parameters 서비스 미연결')
+            return
+        val = float(self.conf_thresh_spin.value())
+        req = SetParameters.Request()
+        p = RclParameter()
+        p.name = 'confidence_threshold'
+        p.value = ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=val)
+        req.parameters = [p]
+        future = cli.call_async(req)
+        future.add_done_callback(
+            lambda f: self._on_param_apply_done(f, f'신뢰도 임계 → {val:.2f}'))
+        self.detect_tune_status.setText(f'신뢰도 적용 중 ({val:.2f})...')
+
+    def _exposure_auto_toggle(self, state):
+        """rgb_camera.enable_auto_exposure 라이브 토글. 켜진 동안엔 수동 슬라이더 비활성화."""
+        enable = bool(state)
+        cli = self.ros_node.cli_camera_set_parameters
+        if not cli.service_is_ready():
+            self.detect_tune_status.setText('⚠ camera set_parameters 서비스 미연결')
+            return
+        req = SetParameters.Request()
+        p = RclParameter()
+        p.name = 'rgb_camera.enable_auto_exposure'
+        p.value = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=enable)
+        req.parameters = [p]
+        future = cli.call_async(req)
+        future.add_done_callback(
+            lambda f: self._on_param_apply_done(f, f'자동노출 → {"ON" if enable else "OFF"}'))
+        self.detect_tune_status.setText(f'자동노출 {"ON" if enable else "OFF"} 적용 중...')
+
+    def _exposure_apply(self):
+        """수동 노출(rgb_camera.exposure, μs) 라이브 적용. 자동노출 OFF 상태일 때만 효과."""
+        cli = self.ros_node.cli_camera_set_parameters
+        if not cli.service_is_ready():
+            self.detect_tune_status.setText('⚠ camera set_parameters 서비스 미연결')
+            return
+        val = int(self.exposure_spin.value())
+        req = SetParameters.Request()
+        p = RclParameter()
+        p.name = 'rgb_camera.exposure'
+        p.value = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=val)
+        req.parameters = [p]
+        future = cli.call_async(req)
+        future.add_done_callback(
+            lambda f: self._on_param_apply_done(f, f'수동 노출 → {val} μs'))
+        if self.auto_exposure_check.isChecked():
+            self.detect_tune_status.setText(
+                f'노출 {val} μs 적용 중... (※ 자동노출 ON 상태라 무시될 수 있음)')
+        else:
+            self.detect_tune_status.setText(f'노출 {val} μs 적용 중...')
+
+    def _on_param_apply_done(self, future, label: str):
+        """공통 응답 처리 — 적용 결과를 detect_tune_status에 표시."""
+        try:
+            results = future.result().results
+            ok = bool(results) and all(r.successful for r in results)
+        except Exception as e:
+            self.ros_node.get_logger().error(f'{label} 실패: {e}')
+            self.detect_tune_status.setText(f'⚠ {label} 실패: {e}')
+            return
+        if ok:
+            self.ros_node.get_logger().info(f'{label} 적용 완료')
+            self.detect_tune_status.setText(f'✅ {label} 적용 완료')
+        else:
+            reason = next((r.reason for r in results if not r.successful), '')
+            self.ros_node.get_logger().warn(f'{label} 거절: {reason}')
+            self.detect_tune_status.setText(f'⚠ {label} 거절: {reason}')
 
     def _call_manual_command(
         self,
@@ -1585,6 +2282,9 @@ class PickPlaceGui(QWidget):
         future = self.ros_node.cli_e_stop_reset.call_async(Trigger.Request())
         future.add_done_callback(_on_done)
 
+    def _clear_error(self):
+        self.ros_node.call_trigger_service(self.ros_node.cli_clear_error, 'pick_place/clear_error')
+
     def _speed_normal(self):
         self.ros_node.call_trigger_service(self.ros_node.cli_speed_normal, 'pick_place/speed_normal')
 
@@ -1609,6 +2309,32 @@ class PickPlaceGui(QWidget):
 
     def _safety_backdrive(self):
         self.ros_node.call_trigger_service(self.ros_node.cli_safety_backdrive, 'pick_place/safety_backdrive')
+
+    def _gripper_bridge_restart(self):
+        """그리퍼 브릿지(gripper_service_node + gripper_node)만 새 프로세스로 재기동한다.
+        status3(Modbus 무응답)가 in-process reinit("그리퍼 리셋")으로 안 풀릴 때의 가벼운 복구.
+        로봇/카메라는 안 건드리고 ~5-40초 안에 복구된다. 전원 사이클 불필요."""
+        from ament_index_python.packages import get_package_share_directory
+
+        proc = self._gripper_bridge_restart_proc
+        if proc is not None and proc.poll() is None:
+            return  # 이미 진행 중
+
+        try:
+            pkg_share = get_package_share_directory('dsr_realsense_pick_place')
+            script = os.path.join(pkg_share, 'scripts', 'restart_gripper_bridge.sh')
+            self._gripper_bridge_restart_proc = subprocess.Popen(
+                ['bash', script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._gripper_bridge_restart_until = time.monotonic() + 45.0
+            self.gripper_bridge_restart_button.setEnabled(False)
+            self.gripper_bridge_restart_label.setText('⏳ 그리퍼 브릿지 재기동 중... (~5-40초, 그리퍼 ready 확인)')
+            self.ros_node.get_logger().warn('🔧 그리퍼 브릿지 재기동 스크립트 실행 (status3 복구)')
+        except Exception as e:
+            self.ros_node.get_logger().error(f'그리퍼 브릿지 재기동 실패: {e}')
+            self.gripper_bridge_restart_label.setText(f'❌ 실패: {e}')
 
     def _system_reset(self):
         """GUI를 제외한 모든 노드를 정상 종료 후 재시작한다.
@@ -1886,6 +2612,12 @@ class PickPlaceGui(QWidget):
         is_e_stopped = state == 'EMERGENCY_STOP'
         is_idle      = state == 'IDLE'
         is_active    = state not in ('IDLE', 'EMERGENCY_STOP')
+        # cancel은 실제 픽 사이클 + HOME 이동 중에만 의미 있음. INITIALIZING/ERROR/BACKDRIVE 제외.
+        is_in_cancelable_motion = state in (
+            'DETECTING', 'PRE_PICK', 'PICK', 'LIFT',
+            'MOVE_TO_PLACE', 'PLACE', 'POST_PLACE', 'HOME',
+        )
+        is_in_error  = state == 'ERROR'
         hw = self.ros_node.hw_state
         if self._reset_in_progress:
             if (not is_e_stopped and hw not in (6, 15)) or time.monotonic() > self._reset_deadline:
@@ -1916,7 +2648,12 @@ class PickPlaceGui(QWidget):
         # ── 긴급 제어 버튼 ────────────────────────────────────────────
         # E-STOP: 항상 활성 (서비스 미연결이어도 클릭 가능해야 하는 최우선 안전 버튼)
         self.e_stop_button.setEnabled(True)
-        self.cancel_button.setEnabled(is_active)
+        self.cancel_button.setEnabled(is_in_cancelable_motion)
+        # 에러 해제: ERROR 상태 + 서비스 연결 + 리셋 진행 중 아닐 때만.
+        clear_error_svc = self.ros_node.cli_clear_error.service_is_ready()
+        self.clear_error_button.setEnabled(
+            is_in_error and clear_error_svc and not self._reset_in_progress
+        )
         if self._reset_in_progress:
             self.e_stop_reset_button.setEnabled(False)
             self.e_stop_reset_button.setText('리셋 중...')
@@ -1934,6 +2671,9 @@ class PickPlaceGui(QWidget):
         )
         manual_busy     = self._manual_command is not None
         command_enabled = manual_enabled and not manual_busy
+        # 설정·튜닝값(min_safe_z, 물체별 파지 강도, 그리퍼 정밀 전류) 편집 게이트.
+        # 캘리브레이션과 동일하게 IDLE 전용 — 동작 중(DETECTING/PICK/LIFT/MOVE 등)엔 편집·적용 불가.
+        config_edit_enabled = is_idle and not manual_busy and not self._reset_in_progress
 
         # HOME: pick_place 서비스 연결 필요
         self.home_button.setEnabled(command_enabled and go_home_svc)
@@ -1963,11 +2703,50 @@ class PickPlaceGui(QWidget):
         self.model_browse_button.setEnabled(True)
         self.model_apply_button.setEnabled(self.ros_node.cli_object_set_parameters.service_is_ready())
 
+        # 검출/노출 조정 — confidence는 detector, 노출은 camera 서비스. 슬라이더는 항상 편집 가능.
+        camera_param_svc = self.ros_node.cli_camera_set_parameters.service_is_ready()
+        self.conf_apply_button.setEnabled(self.ros_node.cli_object_set_parameters.service_is_ready())
+        self.auto_exposure_check.setEnabled(camera_param_svc)
+        # 자동노출 ON이면 수동 슬라이더/적용 비활성 (효과 없으니 혼동 방지)
+        manual_exp_enabled = camera_param_svc and not self.auto_exposure_check.isChecked()
+        self.exposure_slider.setEnabled(manual_exp_enabled)
+        self.exposure_spin.setEnabled(manual_exp_enabled)
+        self.exposure_apply_button.setEnabled(manual_exp_enabled)
+
         # ── 그리퍼 정밀 제어 상태 및 활성화 제어 ─────────────────────────────
         # 실시간 상태 레이블 업데이트
         pres_curr = self.ros_node.gripper_present_current
         pres_pos = self.ros_node.gripper_present_position
         self.gripper_status_label.setText(f'실시간 - 전류: {pres_curr:.0f} mA | 위치: {pres_pos:.0f}')
+
+        # 그리퍼 INIT/REINIT 라벨 — 진행 중이면 "INIT 5/15 | 47s | trying", 막힌 듯하면 stale 표시
+        prog = self.ros_node.gripper_init_progress
+        prog_t = self.ros_node.gripper_init_progress_t
+        age = time.monotonic() - prog_t if prog_t > 0 else 999
+        if gripper_hw_ready:
+            self.gripper_init_label.setText('그리퍼: ✅ 준비')
+            self.gripper_init_label.setStyleSheet(
+                'color: #88ff88; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                'background-color: #003300;')
+        elif prog and age < 30:
+            # 최근 30초 안 메시지 → 진행 중일 가능성 (age가 카운트 되면 시각적 변화)
+            indicator = '🔄' if age < 5 else '⏳'  # 5초 이내 갱신=빠른 진행, 그 이후=느림(stuck 의심)
+            self.gripper_init_label.setText(f'그리퍼: {indicator} {prog} (수신 {age:.0f}s 전)')
+            color = '#ffaa00' if age < 5 else '#ff5500'  # 늦으면 빨강 경향
+            self.gripper_init_label.setStyleSheet(
+                f'color: white; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                f'background-color: {color};')
+        elif prog:
+            # 메시지 30초 이상 stale → stuck/실패 가능성 큼
+            self.gripper_init_label.setText(f'그리퍼: ⚠ STUCK? 마지막 메시지 {age:.0f}s 전: {prog}')
+            self.gripper_init_label.setStyleSheet(
+                'color: white; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                'background-color: #aa0000;')
+        else:
+            self.gripper_init_label.setText('그리퍼: 대기')
+            self.gripper_init_label.setStyleSheet(
+                'color: #aaa; font-weight: bold; padding: 2px 6px; border-radius: 4px;'
+                'background-color: #2a2a2a;')
 
         # 실시간 그래프 데이터 추가
         self.realtime_graph.add_data(pres_curr)
@@ -1987,24 +2766,49 @@ class PickPlaceGui(QWidget):
             )
             
         # 그리퍼 파라미터 적용 버튼 및 컨트롤들 활성화 제어
-        # 적용: 서비스 연결 + 그리퍼 HW 초기화 완료 + 명령 가능 + 이전 요청 완료
+        # 적용: 서비스 연결 + 그리퍼 HW 초기화 완료 + IDLE(설정 편집 게이트) + 이전 요청 완료
         gripper_apply_ok = (
             gripper_param_svc
             and gripper_hw_ready
-            and command_enabled
+            and config_edit_enabled
             and not getattr(self, '_gripper_apply_busy', False)
         )
         self.gripper_apply_button.setEnabled(gripper_apply_ok)
 
-        # 슬라이더/스핀박스: 값 편집은 command_enabled 시 허용 (서비스 없어도 편집 가능)
-        self.close_curr_slider.setEnabled(command_enabled)
-        self.close_curr_spin.setEnabled(command_enabled)
-        self.open_curr_slider.setEnabled(command_enabled)
-        self.open_curr_spin.setEnabled(command_enabled)
-        self.vel_slider.setEnabled(command_enabled)
-        self.vel_spin.setEnabled(command_enabled)
-        self.acc_slider.setEnabled(command_enabled)
-        self.acc_spin.setEnabled(command_enabled)
+        # 슬라이더/스핀박스: 정밀 전류는 설정값이므로 IDLE 전용(동작 중 편집 불가).
+        self.close_curr_slider.setEnabled(config_edit_enabled)
+        self.close_curr_spin.setEnabled(config_edit_enabled)
+        self.open_curr_slider.setEnabled(config_edit_enabled)
+        self.open_curr_spin.setEnabled(config_edit_enabled)
+        self.vel_slider.setEnabled(config_edit_enabled)
+        self.vel_spin.setEnabled(config_edit_enabled)
+        self.acc_slider.setEnabled(config_edit_enabled)
+        self.acc_spin.setEnabled(config_edit_enabled)
+
+        # ── 물체별 파지 강도 버튼 ─────────────────────────────────────
+        # 적용: pick_place set_parameters 연결 + IDLE 전용. 저장: 파일 쓰기라 항상 가능.
+        pickplace_param_svc = self.ros_node.cli_pickplace_set_parameters.service_is_ready()
+        self.grip_strength_apply_button.setEnabled(config_edit_enabled and pickplace_param_svc)
+        self.grip_strength_save_button.setEnabled(True)
+        for _slider, _spin in self._grip_strength_rows.values():
+            _slider.setEnabled(config_edit_enabled)
+            _spin.setEnabled(config_edit_enabled)
+
+        # ── TCP Z 안전 하한 ───────────────────────────────────────────
+        # 적용: pick_place set_parameters 연결 + IDLE 전용. 저장: 파일 쓰기라 항상 가능.
+        self.min_safe_z_apply_button.setEnabled(config_edit_enabled and pickplace_param_svc)
+        self.min_safe_z_save_button.setEnabled(True)
+        self.min_safe_z_spin.setEnabled(config_edit_enabled)
+
+        # ── 그리퍼 브릿지 재시작 버튼 ─────────────────────────────────
+        # 복구용이라 로봇 상태 무관하게 항상 활성. 재기동 진행 중(45s 창)엔만 비활성.
+        gbr_busy = (self._gripper_bridge_restart_proc is not None
+                    and time.monotonic() < self._gripper_bridge_restart_until)
+        self.gripper_bridge_restart_button.setEnabled(not gbr_busy)
+        if not gbr_busy and self._gripper_bridge_restart_proc is not None:
+            if self.gripper_bridge_restart_label.text().startswith('⏳'):
+                self.gripper_bridge_restart_label.setText('✅ 재기동 완료 — 그리퍼 ready 확인 후 사용')
+            self._gripper_bridge_restart_proc = None
 
         # ── 안전 모드 버튼 ────────────────────────────────────────────
         # 속도 모드: E-STOP이 아닐 때 + 서비스 연결 필요
@@ -2074,15 +2878,21 @@ class PickPlaceGui(QWidget):
             self.setStyleSheet('')
 
 
+        # 도달 가능한 물체만 통과 — 버튼·요약 모두 같은 필터 사용.
+        reachable_snapshot = [
+            item for item in detected_snapshot
+            if self._is_object_reachable(item)
+        ]
+
         # 같은 라벨의 물체가 여러 개 검출될 수 있으므로 버튼은 라벨 단위로만 만든다.
         labels = []
-        for item in detected_snapshot:
+        for item in reachable_snapshot:
             label = item.get('label', 'unknown')
             if label not in labels:
                 labels.append(label)
 
         self._refresh_buttons(self._stable_detection_labels(labels), object_buttons_enabled)
-        self._refresh_summary(detected_snapshot)
+        self._refresh_summary(reachable_snapshot)
 
     def _update_manual_command_feedback(self, state: str):
         now = time.monotonic()
@@ -2130,6 +2940,27 @@ class PickPlaceGui(QWidget):
         self.gripper_open_button.setText(texts['gripper_open'])
         self.gripper_close_button.setText(texts['gripper_close'])
         self.recover_home_button.setText(texts['recover_to_home'])
+
+    def _is_object_reachable(self, obj: dict) -> bool:
+        """검출 물체가 도달 가능 영역 안에 있는지 — 박스 한계 + sqrt(x^2+y^2) 반경 둘 다 체크.
+        한계 밖이면 버튼·요약 모두 가린다. pick_place_node의 _cb_pose 검사와 동일 룰 + 반경 추가."""
+        pose = obj.get('pose') or {}
+        try:
+            x = float(pose.get('x', 0.0))
+            y = float(pose.get('y', 0.0))
+            z = float(pose.get('z', 0.0))
+        except (TypeError, ValueError):
+            return False
+        n = self.ros_node
+        if not (n.workspace_x_min <= x <= n.workspace_x_max):
+            return False
+        if not (n.workspace_y_min <= y <= n.workspace_y_max):
+            return False
+        if not (n.workspace_z_min <= z <= n.workspace_z_max):
+            return False
+        if (x * x + y * y) ** 0.5 > n.reach_radius_max:
+            return False
+        return True
 
     def _stable_detection_labels(self, labels: list):
         """짧은 검출 누락으로 물체 버튼이 깜빡이지 않도록 라벨 목록을 안정화한다."""

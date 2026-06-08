@@ -164,8 +164,11 @@ def generate_launch_description():
                     'post_drl_start_sleep_sec': 2.0,
                     'drl_idle_stable_sec': 2.0,
                     'tcp_server_open_retry_sec': 0.5,
-                    'init_attempts': 15,
-                    'init_retry_delay_sec': 5.0,
+                    # DRL이 시작 즉시 시리얼 포트를 강제 recycle하므로 첫 시도에 성공 가능성 높음.
+                    # 그래도 cold-boot/motor stuck 대비 PC 재시도는 남겨둔다.
+                    'init_attempts': 5,            # 첫 시도 깨끗하면 1회로 끝, 보험으로 5회
+                    'init_timeout_sec': 20.0,      # DRL 내부 24×0.5s=12s + serial reset 여유 → 20s면 충분
+                    'init_retry_delay_sec': 1.0,   # 빠른 재시도 (DRL 측 정리 시간 1초면 충분)
                 }]
             ),
             Node(

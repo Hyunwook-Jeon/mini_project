@@ -26,6 +26,7 @@ RealSense RGB-D + YOLOv8 기반 객체 검출 노드.
 
 import json
 import math
+import time
 from pathlib import Path
 
 import rclpy
@@ -44,6 +45,196 @@ import message_filters
 import tf2_ros
 import tf2_geometry_msgs  # noqa: F401  (transform 메서드 등록용)
 from rcl_interfaces.msg import SetParametersResult
+
+
+class TrackedDetectionManager:
+    """ultralytics tracker ID를 사람이 읽기 쉬운 표시 번호로 매핑한다 (클래스별 격리).
+
+    번호는 **클래스마다 따로** 1부터 시작 → `doll_1`과 `unknown_1`이 동시 공존.
+    클래스별 state(tracks/reserved)를 분리해 두면 rebind도 자연스럽게 같은 클래스 안에서만 일어남.
+
+    핵심 기능
+      - 같은 (class, tid) → 같은 표시 번호 유지
+      - 검출 잠깐 끊겨도 grace_sec 동안 GUI에 유지(깜빡임 방지)
+      - tid 사라진 후 reserve_sec 동안 같은 클래스 + 같은 위치(임계 안)에 새 tid 오면 rebind
+      - 다중 후보 시 가장 가까운 reserve 항목으로 매칭 (closest-match tie-break)
+      - **클래스 변경 감지**: 같은 tid가 클래스 사이를 옮기면 옛 클래스에서 만료 처리하고
+        새 클래스에 신규 등록 (라벨 튐을 최소화하기 위해 옛 display는 reserve로 이동)
+
+    시간 단위는 모두 초(seconds, monotonic) — 가변 FPS에 안정적.
+    """
+
+    def __init__(
+        self,
+        appear_sec: float,
+        grace_sec: float,
+        reserve_sec: float,
+        rebind_threshold_m: float,
+    ):
+        self.appear_sec = float(appear_sec)
+        self.grace_sec = float(grace_sec)
+        self.reserve_sec = float(reserve_sec)
+        self.rebind_threshold_m = float(rebind_threshold_m)
+        # class_name -> {"tracks": {tid: entry}, "reserved": {display: {free_at, last_pos}}}
+        #   entry = {"display": int, "first_seen": t, "last_seen": t, "last_pos": (x,y,z),
+        #            "shown": bool, "payload": Any | None}
+        self._by_class: dict[str, dict] = {}
+        # 빠른 역참조 — 동일 tid가 어떤 클래스에 속해 있는지 추적(클래스 변경 감지용).
+        self._tid_to_class: dict[int, str] = {}
+
+    def reset(self) -> None:
+        self._by_class.clear()
+        self._tid_to_class.clear()
+
+    def get_display(self, tracker_id: int) -> int | None:
+        """tid의 현재 display 번호를 조회. 클래스 격리 상태와 무관하게 동작."""
+        cls = self._tid_to_class.get(tracker_id)
+        if cls is None:
+            return None
+        state = self._by_class.get(cls)
+        if state is None:
+            return None
+        e = state["tracks"].get(tracker_id)
+        return e["display"] if e else None
+
+    def set_payload(self, tracker_id: int, payload) -> None:
+        """update() 후 candidate dict를 캐싱한다. grace 중 동일 payload를 재발행하기 위함."""
+        cls = self._tid_to_class.get(tracker_id)
+        if cls is None:
+            return
+        state = self._by_class.get(cls)
+        if state is None:
+            return
+        e = state["tracks"].get(tracker_id)
+        if e is not None:
+            e["payload"] = payload
+
+    def update(
+        self,
+        tracker_id: int,
+        class_name: str,
+        pos_xyz: tuple[float, float, float],
+        now: float | None = None,
+    ) -> tuple[int, bool]:
+        """현재 검출을 manager에 알리고 (표시 번호, 노출 여부)를 받는다."""
+        t = now if now is not None else time.monotonic()
+
+        # 1) 클래스 변경 감지 — 같은 tid가 다른 클래스에서 옮겨오면 옛 entry 만료
+        old_class = self._tid_to_class.get(tracker_id)
+        if old_class is not None and old_class != class_name:
+            self._expire_tid_from_class(tracker_id, old_class, t)
+
+        # 2) 현 클래스 state 확보
+        state = self._get_or_create_state(class_name)
+        entry = state["tracks"].get(tracker_id)
+        if entry is None:
+            # 신규 — 같은 클래스 reserve에서 가까운 후보 있으면 rebind, 없으면 새 번호
+            display = self._pick_rebind_or_new(state, pos_xyz)
+            entry = {
+                "display": display,
+                "first_seen": t,
+                "last_seen": t,
+                "last_pos": pos_xyz,
+                "shown": False,
+                "payload": None,
+            }
+            state["tracks"][tracker_id] = entry
+            self._tid_to_class[tracker_id] = class_name
+        else:
+            entry["last_seen"] = t
+            entry["last_pos"] = pos_xyz
+
+        # appear 임계: 처음 본 이후 appear_sec 지나야 노출
+        if not entry["shown"] and (t - entry["first_seen"]) >= self.appear_sec:
+            entry["shown"] = True
+        return entry["display"], entry["shown"]
+
+    def visible_lost_tracks(self, now: float | None = None) -> list[tuple[int, dict]]:
+        """이번 프레임에 검출되지 않았지만 grace 안이라 아직 GUI에 보여야 하는 트랙들.
+        반환: [(tid, entry)]."""
+        t = now if now is not None else time.monotonic()
+        out: list[tuple[int, dict]] = []
+        for state in self._by_class.values():
+            for tid, e in state["tracks"].items():
+                if e["shown"] and 0.0 < (t - e["last_seen"]) <= self.grace_sec:
+                    out.append((tid, e))
+        return out
+
+    def cleanup_expired(self, now: float | None = None) -> None:
+        """grace 초과한 tid는 reserve로 이동, reserve 초과한 display는 free,
+        빈 클래스 state는 메모리 절약차 제거."""
+        t = now if now is not None else time.monotonic()
+        empty_classes: list[str] = []
+        for class_name, state in self._by_class.items():
+            tracks = state["tracks"]
+            reserved = state["reserved"]
+            # grace 초과 tid 정리
+            dead = [tid for tid, e in tracks.items() if (t - e["last_seen"]) > self.grace_sec]
+            for tid in dead:
+                e = tracks.pop(tid)
+                self._tid_to_class.pop(tid, None)
+                # shown까지 갔던 트랙만 reserve로 (false positive는 폐기)
+                if e["shown"]:
+                    reserved[e["display"]] = {
+                        "free_at": t + self.reserve_sec,
+                        "last_pos": e["last_pos"],
+                    }
+            # reserve 만료 정리
+            expired = [d for d, r in reserved.items() if t >= r["free_at"]]
+            for d in expired:
+                reserved.pop(d, None)
+            if not tracks and not reserved:
+                empty_classes.append(class_name)
+        for c in empty_classes:
+            self._by_class.pop(c, None)
+
+    # ── 내부 ─────────────────────────────────────────────────────
+    def _get_or_create_state(self, class_name: str) -> dict:
+        s = self._by_class.get(class_name)
+        if s is None:
+            s = {"tracks": {}, "reserved": {}}
+            self._by_class[class_name] = s
+        return s
+
+    def _expire_tid_from_class(self, tracker_id: int, old_class: str, t: float) -> None:
+        """tid가 다른 클래스로 옮겨갈 때 — 옛 클래스에서 entry 제거.
+        shown 상태였다면 display는 reserve로 보내 grace+reserve 동안 회수 보호."""
+        old_state = self._by_class.get(old_class)
+        if old_state is None:
+            return
+        e = old_state["tracks"].pop(tracker_id, None)
+        if e is not None and e["shown"]:
+            old_state["reserved"][e["display"]] = {
+                "free_at": t + self.reserve_sec,
+                "last_pos": e["last_pos"],
+            }
+        self._tid_to_class.pop(tracker_id, None)
+
+    def _pick_rebind_or_new(self, state: dict, pos_xyz: tuple[float, float, float]) -> int:
+        """같은 클래스 state의 reserve 중 임계 안에서 가장 가까운 항목으로 rebind. 없으면 새 번호."""
+        best_d = self.rebind_threshold_m
+        best_disp = None
+        for disp, r in state["reserved"].items():
+            d = _dist3(r["last_pos"], pos_xyz)
+            if d <= best_d:
+                best_d = d
+                best_disp = disp
+        if best_disp is not None:
+            state["reserved"].pop(best_disp, None)
+            return best_disp
+        return self._next_free_number(state)
+
+    def _next_free_number(self, state: dict) -> int:
+        used = {e["display"] for e in state["tracks"].values()} | set(state["reserved"].keys())
+        n = 1
+        while n in used:
+            n += 1
+        return n
+
+
+def _dist3(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    dx, dy, dz = a[0] - b[0], a[1] - b[1], a[2] - b[2]
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
 class ObjectDetectorNode(Node):
@@ -66,8 +257,27 @@ class ObjectDetectorNode(Node):
         # 또는 네트워크에서 다운로드한다. n(nano) < s < m < l < x 순서로 정확도/속도 트레이드오프.
         self.declare_parameter('yolo_model', 'yolov8n.pt')
         self.declare_parameter('confidence_threshold', 0.5)
-        # target_classes: 검출 대상 클래스 이름 목록 (COCO 기준). 빈 리스트이면 전체 클래스 허용.
-        self.declare_parameter('target_classes', ['bottle', 'cup', 'bowl', 'sports ball', 'orange', 'apple'])
+        # target_classes: 검출 대상 클래스 이름 목록.
+        # ⚠️ ROS2 humble은 yaml의 빈 배열 []에서 string array 타입을 못 추론해 노드가 죽는다.
+        # 빈 string [""]를 default로 쓰면 yaml 미지정 시에도 type=STRING_ARRAY가 보장되고,
+        # 코드에서는 빈 문자열을 filter out해 결과적으로 "전체 통과"가 된다.
+        self.declare_parameter('target_classes', [''])
+        # ── 추적/디바운스 (검출 안정화: tracker ID → 클래스별 표시 번호) ──
+        # 통합 학습 모델 가정: 우리가 학습시킨 클래스(known_classes)는 클래스명 그대로 ("doll_1"),
+        # 모델이 'object'로 출력한(또는 known set 밖의) 검출은 'unknown_N'으로 표시.
+        # 짧은 occlusion·검출 jitter는 manager가 흡수해 깜빡임 최소화.
+        self.declare_parameter('tracker_type', 'botsort_custom.yaml')
+        self.declare_parameter('debounce_appear_sec', 0.0)
+        self.declare_parameter('debounce_grace_sec', 1.0)
+        self.declare_parameter('display_number_reserve_sec', 2.0)
+        self.declare_parameter('rebind_position_threshold_m', 0.03)
+        # 통계 로그 주기 (매 N 프레임마다 raw/tracker_passed/shown 출력. 0=꺼짐).
+        # 검출률 측정용 — appear/tracker 필터로 얼마나 떨어지는지 시각화.
+        self.declare_parameter('detection_stats_log_period', 30)
+        # known_classes — 정답(학습 인지) 클래스 목록. 이 외 검출은 unknown_N으로 표시.
+        # 통상 pick_place_node의 grip_class_names와 동일 값으로 유지하는 것이 권장 (라벨↔강도 일치).
+        # 빈 문자열만 있으면 → 모든 클래스를 unknown 처리(권장 X, 통합 모델 전 임시).
+        self.declare_parameter('known_classes', [''])
         # depth_scale: RealSense depth 이미지의 raw 값(uint16, mm 단위)을 m 단위로 바꾸는 계수.
         # D400 시리즈 기본값은 0.001 (1 raw = 1 mm).
         self.declare_parameter('depth_scale', 0.001)
@@ -112,7 +322,41 @@ class ObjectDetectorNode(Node):
         self.robot_base_frame = p('robot_base_frame').value
         self.use_yolo = p('use_yolo').value
         self.conf_thresh = p('confidence_threshold').value
-        self.target_classes = p('target_classes').value
+        # 빈 문자열은 무시 — yaml의 [""] / 의도된 "전체 통과" 케이스를 깔끔히 처리
+        _raw_classes = list(p('target_classes').value)
+        self.target_classes = [c.strip() for c in _raw_classes if c and c.strip()]
+        # known_classes: 정답(학습) 클래스 set — 빈 문자열 무시. 'object'는 자동으로 unknown 처리.
+        _raw_known = list(p('known_classes').value)
+        self._known_classes = {c.strip() for c in _raw_known if c and c.strip()}
+        # 'object'를 known_classes에 넣는 건 의미 없음(이미 unknown 마커). 자동 제외.
+        self._known_classes.discard('object')
+        # 추적/디바운스
+        self.tracker_type = p('tracker_type').value
+        self._track_manager = TrackedDetectionManager(
+            appear_sec=float(p('debounce_appear_sec').value),
+            grace_sec=float(p('debounce_grace_sec').value),
+            reserve_sec=float(p('display_number_reserve_sec').value),
+            rebind_threshold_m=float(p('rebind_position_threshold_m').value),
+        )
+        self._tracker_yaml_path = self._resolve_tracker_yaml(self.tracker_type)
+        self.get_logger().info(
+            f'추적 설정: tracker={self._tracker_yaml_path or "(ultralytics 기본)"}, '
+            f'appear={p("debounce_appear_sec").value}s, grace={p("debounce_grace_sec").value}s, '
+            f'reserve={p("display_number_reserve_sec").value}s, '
+            f'rebind={p("rebind_position_threshold_m").value}m')
+        # 통계 카운터 — 매 N 프레임마다 출력
+        self._stats_period = int(p('detection_stats_log_period').value)
+        self._stats_frame = 0
+        self._stats_raw = 0          # detector.track() 통과한 box(.id 부여된) 개수
+        self._stats_no_id = 0        # box.id is None으로 skip된 개수
+        self._stats_shown = 0        # appear 임계 통과해 GUI에 노출된 개수
+        self._stats_lost_grace = 0   # 검출은 안 됐지만 grace 안이라 노출된 개수
+        self.get_logger().info(
+            f'known_classes(정답 클래스) = {sorted(self._known_classes) if self._known_classes else "(없음 — 모두 unknown_N으로 표시)"}'
+        )
+        self.get_logger().info(
+            '  ↑ pick_place의 grip_class_names와 동일하게 유지해야 라벨↔강도가 일관됨'
+        )
         self.depth_scale = p('depth_scale').value
         self.min_depth = p('min_depth_m').value
         self.max_depth = p('max_depth_m').value
@@ -145,6 +389,8 @@ class ObjectDetectorNode(Node):
         self.model = None
         if self.use_yolo:
             self._load_yolo()
+        # 모델 로드 후, known_classes와 model.names가 어긋났는지 안내 (안전망)
+        self._warn_class_alignment()
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         # ── TF2 ─────────────────────────────────────────────────────────
@@ -197,6 +443,9 @@ class ObjectDetectorNode(Node):
                                               '/detected_object_pose', 10)
         self.pub_selected_pose = self.create_publisher(PoseStamped,
                                                        '/selected_object_pose', 10)
+        # 선택된 물체의 클래스명 — pick_place가 물체별 그리퍼 강도를 정할 때 사용한다.
+        # 좌표(pub_selected_pose)와 함께 발행해 자동/수동 선택 모두에서 라벨을 알 수 있게 한다.
+        self.pub_selected_class = self.create_publisher(String, '/selected_object_class', 10)
         self.pub_objects = self.create_publisher(String, '/detected_objects', 10)
         self.pub_debug = self.create_publisher(
             Image, '/detection_debug_image', qos_profile_sensor_data
@@ -261,6 +510,26 @@ class ObjectDetectorNode(Node):
 
         return str((self._repo_root() / model_path).resolve())
 
+    def _resolve_tracker_yaml(self, name: str) -> str | None:
+        """tracker yaml 파일을 우선 share/<pkg>/config에서 찾고 없으면 후보 루트에서 검색.
+        못 찾으면 None 반환 → ultralytics .track()에 None을 넘기면 기본 botsort.yaml 사용."""
+        if not name:
+            return None
+        cand: list[Path] = []
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            share = Path(get_package_share_directory('dsr_realsense_pick_place'))
+            cand.append(share / 'config' / name)
+        except Exception:
+            pass
+        for root in self._candidate_search_roots():
+            cand.append(root / 'config' / name)
+            cand.append(root / name)
+        for p in cand:
+            if p.is_file():
+                return str(p.resolve())
+        return None
+
     # ────────────────────────────────────────────────────────────────────
     # YOLO 로드
     # ────────────────────────────────────────────────────────────────────
@@ -276,6 +545,9 @@ class ObjectDetectorNode(Node):
             # model_name 이 파일 경로면 로컬 파일을, 문자열이면 기본 weight 이름을 읽는다.
             self.model = YOLO(model_name)
             self.use_yolo = True
+            # 모델이 바뀌면 tracker 내부 상태가 다른 모델 기반이라 표시 번호도 비워야 일관성 유지.
+            if hasattr(self, '_track_manager'):
+                self._track_manager.reset()
             self.get_logger().info(f'YOLO 모델 로드 완료: {model_name}')
             return True
         except ImportError:
@@ -301,6 +573,34 @@ class ObjectDetectorNode(Node):
                 self.use_yolo = False
             return False
 
+    def _warn_class_alignment(self) -> None:
+        """known_classes(우리 설정)와 model.names(모델이 실제 학습한 클래스) 정합성 점검.
+        둘이 어긋나면 라벨이 의도와 다르게 나갈 수 있으므로 시작 시 warn 발행."""
+        if not self.model:
+            return
+        try:
+            model_classes = {str(v).strip() for v in self.model.names.values()}
+        except Exception:
+            return
+        if not model_classes:
+            return
+        known = set(self._known_classes)
+        # (a) 모델이 알지만 known_classes 미등록 → unknown_N으로 표시될 클래스 (정보)
+        extra_in_model = model_classes - known - {'object'}
+        if extra_in_model:
+            self.get_logger().warn(
+                f'⚠️ 모델은 학습했지만 known_classes 미등록 = {sorted(extra_in_model)} '
+                f'→ unknown_N으로 표시됨. yaml의 known_classes/grip_class_names 에 추가하세요.')
+        # (b) known_classes에 적었지만 모델이 모름 → 검출 자체 안 됨 (경고)
+        missing_in_model = known - model_classes
+        if missing_in_model:
+            self.get_logger().warn(
+                f'⚠️ known_classes 등록됐지만 모델이 학습 안 함 = {sorted(missing_in_model)} '
+                f'→ 검출 자체가 안 됨. yaml에서 빼거나 모델 재학습 필요.')
+        if not extra_in_model and not missing_in_model:
+            self.get_logger().info(
+                f'✅ known_classes ↔ model.names 정합 OK (학습된 클래스 = {sorted(model_classes)})')
+
     def _on_parameters_changed(self, params):
         calib_updates = {}
         model_update = None
@@ -319,6 +619,33 @@ class ObjectDetectorNode(Node):
                     )
             elif param.name == 'yolo_model':
                 model_update = str(param.value).strip()
+            elif param.name == 'confidence_threshold':
+                # YOLO 검출 임계. _detect_yolo가 매 프레임 self.conf_thresh를 읽으므로 즉시 반영.
+                try:
+                    new_val = float(param.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False, reason='confidence_threshold: 숫자 값 필요')
+                if not (0.0 <= new_val <= 1.0):
+                    return SetParametersResult(
+                        successful=False, reason='confidence_threshold: 0.0~1.0 범위')
+                self.conf_thresh = new_val
+                self.get_logger().info(f'confidence_threshold → {new_val:.2f}')
+            elif param.name == 'known_classes':
+                # 정답 클래스 set 라이브 갱신 — 다음 프레임부터 라벨 prefix 적용 바뀜.
+                # GUI 강도 편집기 적용 시 동기 호출되어 sync.
+                try:
+                    raw = list(param.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False, reason='known_classes: 문자열 배열 필요')
+                new_known = {str(c).strip() for c in raw if c and str(c).strip()}
+                new_known.discard('object')
+                self._known_classes = new_known
+                self.get_logger().info(
+                    f'known_classes 갱신 → {sorted(new_known) if new_known else "(빈 set)"}')
+                # 변경 즉시 alignment 재확인 (모델은 그대로라 mismatch 체크 결과만 바뀜)
+                self._warn_class_alignment()
 
         if model_update is not None:
             if not model_update:
@@ -417,26 +744,15 @@ class ObjectDetectorNode(Node):
 
         debug_img = color_img.copy()
         candidates = []
+        now_t = time.monotonic()
 
-        for u, v, w, h, label, conf in detections:
+        for u, v, w, h, label_class, conf, tid in detections:
             # bbox 중심 주변에서 안정적인 depth 대표값을 먼저 구한다.
             depth_m = self._estimate_depth_m(depth_img, u, v)
             if depth_m is None:
                 continue
 
-            # GUI에서 확인할 수 있도록 검출 결과와 depth를 영상 위에 그린다.
-            cv2.rectangle(debug_img,
-                          (u - w // 2, v - h // 2),
-                          (u + w // 2, v + h // 2),
-                          (0, 255, 0), 2)
-            cv2.putText(debug_img,
-                        f'{label} {conf:.2f} | {depth_m:.3f}m',
-                        (u - w // 2, v - h // 2 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
             # 픽셀 좌표를 RealSense optical frame 3D 좌표로 바꾼다.
-            # 수동 절대좌표 모드에서는 이후 yolo_live_cam_3d_metrics와 같은
-            # 프로젝트 좌표계로 다시 변환한다.
             pose_optical = self._pixel_to_optical_pose(u, v, depth_m)
             pose_abs = self._to_absolute_pose(pose_optical)
             if pose_abs is None:
@@ -449,8 +765,38 @@ class ObjectDetectorNode(Node):
                     self._set_pose_yaw_deg(pose_abs, yaw_deg)
 
             pos = pose_abs.pose.position
-            candidates.append({
-                'label': label,
+
+            # 추적 manager로 표시 번호 결정 (yolo 결과만 — color fallback은 tid=None이라 그대로 사용)
+            if tid is not None:
+                self._stats_raw += 1
+                display_num, should_show = self._track_manager.update(
+                    tid, label_class, (pos.x, pos.y, pos.z), now=now_t)
+                if not should_show:
+                    continue
+                self._stats_shown += 1
+            else:
+                display_num = None
+
+            # 임시 라벨 — 아래에서 클래스별 카운트 보고 단독이면 prefix만, 여럿이면 prefix_N로 최종 결정
+            is_known = label_class != 'object' and label_class in self._known_classes
+            prefix = label_class if is_known else 'unknown'
+            display_label = f'{prefix}_{display_num}' if display_num is not None else prefix
+
+            # 디버그 영상은 표시 번호 기반으로 그린다 (사용자가 보는 번호와 일치)
+            cv2.rectangle(debug_img,
+                          (u - w // 2, v - h // 2),
+                          (u + w // 2, v + h // 2),
+                          (0, 255, 0), 2)
+            cv2.putText(debug_img,
+                        f'{display_label} {label_class} {conf:.2f} | {depth_m:.3f}m',
+                        (u - w // 2, v - h // 2 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            candidate = {
+                'label': display_label,      # GUI 표시 + _choose_target 필터용 (count 보고 아래에서 재확정)
+                'class_name': label_class,   # 원본 yolo 클래스 (그리퍼 강도 룩업)
+                'tracker_id': tid,           # ultralytics tracker id (디버그/GUI 안정화용)
+                'display_num': display_num,  # 클래스 내 표시 번호 (None = color fallback)
                 'confidence': conf,
                 'depth_m': depth_m,
                 'pixel_u': u,
@@ -462,7 +808,11 @@ class ObjectDetectorNode(Node):
                     'z': pos.z,
                     'yaw_deg': yaw_deg,
                 },
-            })
+            }
+            candidates.append(candidate)
+            # manager에 캐시 — grace 동안(다음 프레임 검출 빠질 때) 같은 후보를 재발행.
+            if tid is not None:
+                self._track_manager.set_payload(tid, candidate)
 
             if yaw_deg is not None:
                 cv2.putText(debug_img,
@@ -470,6 +820,51 @@ class ObjectDetectorNode(Node):
                             (u - w // 2, v + h // 2 + 18),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 2)
 
+        # 이번 프레임에 검출 안 됐지만 grace 안이라 GUI엔 유지해야 하는 트랙들을 추가 발행.
+        # _choose_target에도 같이 넘겨, 사용자가 그 사이 클릭해도 마지막 좌표로 처리 가능.
+        for _tid, _entry in self._track_manager.visible_lost_tracks(now=now_t):
+            cached = _entry.get('payload')
+            if cached is not None:
+                candidates.append(cached)
+                self._stats_lost_grace += 1
+        self._track_manager.cleanup_expired(now=now_t)
+
+        # ── 통계 로그 (매 N 프레임마다) ──
+        if self._stats_period > 0:
+            self._stats_frame += 1
+            if self._stats_frame >= self._stats_period:
+                total_box = self._stats_raw + self._stats_no_id
+                self.get_logger().info(
+                    f'[검출통계 {self._stats_frame}프레임] '
+                    f'tracker 통과={self._stats_raw}, '
+                    f'box.id=None skip={self._stats_no_id} '
+                    f'(전체 {total_box}건 중 {self._stats_no_id*100//max(total_box,1)}% drop), '
+                    f'GUI 노출(appear OK)={self._stats_shown}, grace 유지={self._stats_lost_grace}'
+                )
+                self._stats_frame = 0
+                self._stats_raw = self._stats_no_id = self._stats_shown = self._stats_lost_grace = 0
+
+        # ── 카운트 기반 라벨 재확정 ─────────────────────────────────────
+        # 클래스 안에 보이는 인스턴스가 1개면 "doll" / 2+면 "doll_1","doll_2".
+        # candidate dict는 manager의 payload와 같은 참조라 여기서 수정하면
+        # 다음 프레임 grace 재발행 시에도 동일 라벨이 유지됨.
+        from collections import Counter
+        class_counts = Counter(c.get('class_name', '') for c in candidates)
+        for c in candidates:
+            cls = c.get('class_name', '')
+            is_known = cls != 'object' and cls in self._known_classes
+            prefix = cls if is_known else 'unknown'
+            disp = c.get('display_num')
+            if class_counts.get(cls, 0) <= 1 or disp is None:
+                c['label'] = prefix
+            else:
+                c['label'] = f'{prefix}_{disp}'
+
+        # GUI 버튼 위치 안정화 — 클래스명 + display_num 순으로 정렬해서 발행 순서 일관
+        candidates.sort(key=lambda c: (
+            c.get('class_name', ''),
+            c.get('display_num') if c.get('display_num') is not None else 0,
+        ))
         self._publish_detected_objects(candidates)
 
         # 디버그 영상은 GUI와 현장 확인용으로 별도 토픽에 내보낸다.
@@ -485,6 +880,8 @@ class ObjectDetectorNode(Node):
         pos = pose_base.pose.position
         self.pub_pose.publish(pose_base)
         self.pub_selected_pose.publish(pose_base)
+        # 그리퍼 강도 룩업용 — 표시 라벨([1]) 아닌 원본 클래스 이름을 발행
+        self.pub_selected_class.publish(String(data=selected.get('class_name', selected['label'])))
         self.get_logger().info(
             f'[{selected["label"]}] 절대좌표: '
             f'x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f} m '
@@ -737,12 +1134,16 @@ class ObjectDetectorNode(Node):
 
     def _publish_detected_objects(self, candidates: list):
         # GUI가 별도 커스텀 메시지 없이 바로 읽을 수 있도록 JSON 문자열로 묶어 발행한다.
+        # label은 표시용([1] 등), class_name은 원본 yolo 클래스, tracker_id는 안정 키(GUI가
+        # 이 값을 키로 쓰면 시각적 깜빡임 추가 억제 가능).
         msg = String()
         msg.data = json.dumps({
             'selected_label': self.selected_object_label,
             'objects': [
                 {
                     'label': item['label'],
+                    'class_name': item.get('class_name', item['label']),
+                    'tracker_id': item.get('tracker_id'),
                     'confidence': item['confidence'],
                     'depth_m': item['depth_m'],
                     'pixel_u': item['pixel_u'],
@@ -755,56 +1156,78 @@ class ObjectDetectorNode(Node):
         self.pub_objects.publish(msg)
 
     def _choose_target(self, candidates: list):
-        # 선택한 라벨이 있으면 그 라벨만 남기고,
-        # 그렇지 않으면 전체 후보 중 가장 가까운 물체를 pick 대상으로 사용한다.
-        filtered = candidates
-        if self.selected_object_label:
-            filtered = [
+        """사용자가 라벨을 골랐으면 그 라벨로 우선 정확 매칭, 없으면 prefix(=클래스 그룹)로 fallback.
+        둘 다 없으면 자동 선택(가장 가까운 것)."""
+        sel = self.selected_object_label
+        if sel:
+            # 1차: 정확 매칭 (예: 사용자가 "doll_2" 또는 "doll" 누름 → 같은 라벨)
+            exact = [item for item in candidates if item['label'] == sel]
+            if exact:
+                return min(exact, key=lambda item: item['depth_m'])
+            # 2차: prefix 매칭 — 사장님이 "doll" 누른 사이 doll이 늘어 "doll_1","doll_2"가 됐을 때
+            # 또는 "doll_2"가 사라지고 단독 "doll"이 됐을 때. 같은 클래스 그룹 내에서 가장 가까운 것.
+            prefix = sel.rsplit('_', 1)[0] if '_' in sel else sel
+            prefixed = [
                 item for item in candidates
-                if item['label'] == self.selected_object_label
+                if item['label'] == prefix or item['label'].startswith(f'{prefix}_')
             ]
-        if not filtered:
-            if self.selected_object_label:
-                # LIFT / MOVE_TO_PLACE 중에는 물체가 카메라에서 사라지는 것이 정상이므로
-                # 불필요한 WARN 폭격을 억제한다.
-                _suppress_states = {'LIFT', 'MOVE_TO_PLACE'}
-                if self._pick_place_state not in _suppress_states:
-                    self.get_logger().warn(
-                        f'선택한 물체({self.selected_object_label})가 현재 화면에서 검출되지 않음',
-                        throttle_duration_sec=2.0
+            if prefixed:
+                if self._pick_place_state not in {'LIFT', 'MOVE_TO_PLACE'}:
+                    self.get_logger().info(
+                        f'선택({sel}) 정확 매칭 없음 → 같은 클래스({prefix}) 그룹에서 가장 가까운 것 선택',
+                        throttle_duration_sec=2.0,
                     )
+                return min(prefixed, key=lambda item: item['depth_m'])
+            # 아무것도 없음
+            _suppress_states = {'LIFT', 'MOVE_TO_PLACE'}
+            if self._pick_place_state not in _suppress_states:
+                self.get_logger().warn(
+                    f'선택한 물체({sel})가 현재 화면에서 검출되지 않음',
+                    throttle_duration_sec=2.0,
+                )
             return None
-        return min(filtered, key=lambda item: item['depth_m'])
+        # 자동 선택 — 가장 가까운 것
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item['depth_m'])
 
     # ────────────────────────────────────────────────────────────────────
     # YOLO 검출
     # ────────────────────────────────────────────────────────────────────
     def _detect_yolo(self, img: np.ndarray) -> list:
-        """YOLOv8로 이미지에서 물체를 검출하고 (u, v, w, h, label, conf) 리스트를 반환한다.
+        """YOLOv8 + 추적으로 이미지에서 물체를 검출.
 
-        반환 형식: [(중심 u, 중심 v, bbox 폭, bbox 높이, 클래스 이름, confidence), ...]
-          - 이 형식으로 통일해야 이후 depth 추정(_estimate_depth_m)과 시각화 코드가
-            YOLO/색상 검출 방식과 무관하게 동일하게 동작한다.
-          - target_classes가 설정된 경우 해당 클래스가 아닌 결과는 필터링한다.
+        반환: [(u, v, w, h, label_class, conf, tracker_id), ...]
+          - label_class는 yolo의 원본 클래스 이름(예: 'object'/'doll').
+          - tracker_id는 ultralytics BoT-SORT/ByteTrack이 부여하는 고유 ID(int).
+          - tracker가 ID 미부여 상태(첫 프레임 일부)면 그 검출은 skip.
         """
-        # verbose=False: 매 프레임마다 터미널에 검출 결과가 출력되지 않도록 설정
-        results = self.model(img, conf=self.conf_thresh, verbose=False)
+        track_kwargs = dict(conf=self.conf_thresh, persist=True, verbose=False)
+        if self._tracker_yaml_path:
+            track_kwargs['tracker'] = self._tracker_yaml_path
+        results = self.model.track(img, **track_kwargs)
         detections = []
         for r in results:
+            if r.boxes is None:
+                continue
             for box in r.boxes:
+                # tracker가 아직 ID를 부여 못한 검출은 안정적이지 않으므로 skip
+                if box.id is None:
+                    self._stats_no_id += 1
+                    continue
                 cls_id = int(box.cls[0])
-                label = self.model.names[cls_id]   # COCO 클래스 이름 (예: 'bottle')
-                # target_classes가 빈 리스트이면 모든 클래스 통과, 아니면 목록 내 클래스만 허용
-                if self.target_classes and label not in self.target_classes:
+                label_class = self.model.names[cls_id]   # 원본 클래스 이름
+                # target_classes가 빈 리스트이면 모든 클래스 통과
+                if self.target_classes and label_class not in self.target_classes:
                     continue
                 conf = float(box.conf[0])
-                # xyxy 형식: [x_min, y_min, x_max, y_max] (픽셀 좌표)
                 x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-                u = (x1 + x2) // 2   # bbox 중심 x (깊이 샘플링 기준점)
-                v = (y1 + y2) // 2   # bbox 중심 y
+                u = (x1 + x2) // 2
+                v = (y1 + y2) // 2
                 w = x2 - x1
                 h = y2 - y1
-                detections.append((u, v, w, h, label, conf))
+                tid = int(box.id[0])
+                detections.append((u, v, w, h, label_class, conf, tid))
         return detections
 
     # ────────────────────────────────────────────────────────────────────
@@ -850,7 +1273,7 @@ class ObjectDetectorNode(Node):
             u = x + w // 2
             v = y + h // 2
             # confidence는 의미 없으므로 1.0으로 고정 (YOLO 형식과 통일)
-            detections.append((u, v, w, h, 'red_object', 1.0))
+            detections.append((u, v, w, h, 'red_object', 1.0, None))
         return detections
 
 

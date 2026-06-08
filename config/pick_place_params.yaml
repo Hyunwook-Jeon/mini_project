@@ -15,13 +15,28 @@ object_detector:
 
     # --- YOLO 설정 ---
     use_yolo: true
-    yolo_model: "runs/weights/weights/best.pt"
+    yolo_model: "/home/pyw/kairos_ws/goods_yolo.pt"
     confidence_threshold: 0.5
 
 
-    # 인식할 클래스 목록 (빈 리스트이면 모든 클래스)
-    # COCO 클래스 이름 사용: https://docs.ultralytics.com/datasets/detect/coco/
-    target_classes: ["doll", "pack", "pencil", "tape", "cup"]
+    # 인식할 클래스 목록 — 빈 문자열만 있으면 모든 클래스 통과로 처리(코드 측에서 strip 필터).
+    # ROS2 humble은 yaml의 진짜 빈 리스트 []의 타입 추론을 못해 노드 사망. [""]는 string array로 OK.
+    # 현재 모델(goods_yolo.pt)은 10개 클래스 멀티클래스 검출 모델이다.
+    target_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+
+    # known(정답·학습) 클래스 — 라벨에 클래스명 그대로 사용(예: "can_1").
+    # 이 외 검출은 'unknown_N'으로 표시. 현재 모델 10개 클래스를 그대로 등록.
+    # pick_place_node의 grip_class_names와 동일 값으로 유지해야 한다. 어긋나면 시작 시 warn 발행.
+    # GUI 강도 편집기에서 저장 누르면 이 줄도 자동 동기화됨.
+    known_classes: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+
+    # --- 추적/디바운스 (검출 안정화: tracker ID 기반 표시 번호 [1],[2],...) ---
+    tracker_type: "botsort_custom.yaml"  # 패키지 share/config 안의 파일명. 없으면 ultralytics 기본 사용
+    debounce_appear_sec: 0.0             # 0 = 첫 프레임부터 즉시 노출(검출률 우선). false-positive↑면 0.05~0.15로
+    debounce_grace_sec: 1.0              # 마지막 검출 이후 GUI에 유지
+    display_number_reserve_sec: 2.0      # 번호 회수 유예 (이 동안 같은 위치에 새 tid 오면 rebind)
+    rebind_position_threshold_m: 0.03    # rebind 위치 임계 (3cm)
+    detection_stats_log_period: 30       # 매 N 프레임마다 raw/tracker/shown 통계 로그 (0=꺼짐)
 
     # --- Depth 파라미터 ---
     depth_scale: 0.001              # mm → m (RealSense 기본값)
@@ -80,8 +95,9 @@ rh_p12_rna_gripper:
     svc_timeout: 10.0
     state_hz: 20.0
     # --- 그리퍼 동작 전류 (mA) — gripper_node가 실제로 읽는 이름 ---
-    open_current: 400           # 열기 전류 한계 (구 init_current)
-    close_current: 300          # 닫기/파지 전류 한계 (구 cube_current)
+    open_current: 200           # 열기 전류 한계 — open 직전 goal_current 급등(물체 압착) 방지 위해 낮춤
+    close_current: 200          # 닫기/파지 전류 한계 (구 cube_current)
+    transport_current: 80      # 이송 전류 — 파지 후 들고 이동 시 (낮으면 발열↓, 너무 낮으면 이송 중 낙하)
     # --- 모터 속도/가속도 프로파일 ---
     profile_velocity: 1500      # 구동 속도(레지스터 280). 너무 높이면 물체 접촉 시 과부하 위험
     profile_acceleration: 1000  # 구동 가속도(레지스터 278)
@@ -91,11 +107,27 @@ rh_p12_rna_gripper:
     # --- 파지 감지 위치 범위 ---
     min_grip_pos: 500           # 이 위치부터 파지 전류 감지 시작
     max_grip_pos: 700           # 이 이상 = 물체 없음(완전 닫힘)
+    # --- 파지 감지 임계 전류 (mA) — close_current(전류 한계)와 분리 ---
+    # present_current가 이 값 이상이면 접촉(파지)으로 판단. close_current보다 낮게 둬
+    # 포화 전에 접촉 감지 → 빨리 위치 락. free-run/노이즈(~68mA)보단 충분히 높게.
+    # 코드에서 min(grasp_detect_current, close_current)로 clamp하므로 한계는 안 넘음.
+    grasp_detect_current: 100
 
 pick_place_gui:
   ros__parameters:
     use_local_yolo: false
-    
+    # 도달 가능 영역 필터 — 이 범위 밖 검출 물체는 GUI 버튼·요약 자체를 숨긴다.
+    # pick_place_node.workspace_*와 동일 값 유지 권장. reach_radius_max는 박스와 별개로
+    # sqrt(x^2+y^2)에 적용 — Doosan E0509 실제 리치는 900mm(0.9m). 테이블 높이 수직 파지 시
+    # 평면 리치 감소 + 안전여유 고려해 0.80m (실측상 0.8까지 동작 확인). 0.9 full은 특이점 위험.
+    workspace_x_min: 0.15
+    workspace_x_max: 0.80
+    workspace_y_min: -0.60
+    workspace_y_max: 0.60
+    workspace_z_min: 0.0
+    workspace_z_max: 0.60
+    reach_radius_max: 0.80
+
 pick_place_node:
   ros__parameters:
     # --- 로봇 설정 ---
@@ -117,6 +149,29 @@ pick_place_node:
     # gripper_node의 motion_wait(1.5s)보다 길게 설정해야
     # 그리퍼 동작 완료 후 다음 로봇 모션이 시작됩니다.
     gripper_wait_sec: 1.7           # 그리퍼 동작 대기 시간 (s)
+
+    # --- 물체별 파지 전류(강도) (mA) ---
+    # 파지 직전, 선택된 물체 클래스(/selected_object_class)에 따라
+    # gripper_node의 close_current 파라미터를 아래 값으로 바꾼 뒤 close한다.
+    # 값이 낮을수록 약하게 잡는다. 맵에 없는/미인식 물체는 grip_current_default 사용.
+    # grip_class_names ↔ grip_class_currents 는 같은 순서로 1:1 대응.
+    # 아래 값은 현장 튜닝 시작값 — 실기에서 물체별로 미끄러짐/손상 보며 조정할 것.
+    # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
+    grip_current_default: 200
+    grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
+    grip_class_currents: [150, 200, 150, 120, 180, 150, 180, 200, 150, 150]
+    grip_current_min: 100           # 안전 clamp 하한
+    grip_current_max: 500           # 안전 clamp 상한
+
+    # 격리 토글 — false로 두면 close 직전 SetParameters 호출 우회 (이전 세션 동작).
+    # close 실패가 이 신규 코드 때문인지 검증할 때 false로 임시 변경 후 재시작.
+    # 신규 코드 무관 입증되면 true로 되돌림.
+    enable_dynamic_grip_current: true
+
+    # --- 안전 하한 ---
+    # TCP가 이 높이(base_link 기준, m) 아래로는 절대 못 내려가게 _move_to_cart에서 강제 클램프.
+    # 0.0 = base_link 평면(클램프 사실상 비활성). 실제 테이블/지그 높이에 맞춰 올려서 충돌 방지.
+    min_safe_z: 0.005
 
     # --- Pick 파라미터 ---
     pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)
