@@ -164,11 +164,14 @@ def generate_launch_description():
                     'post_drl_start_sleep_sec': 2.0,
                     'drl_idle_stable_sec': 2.0,
                     'tcp_server_open_retry_sec': 0.5,
+                    'poll_rate_hz': 10.0,          # RS-485 폴링 20→10Hz. 부하 절반으로 모션 경합 시 status3 회피(stroke 시절 10Hz). 실험중.
                     # DRL이 시작 즉시 시리얼 포트를 강제 recycle하므로 첫 시도에 성공 가능성 높음.
                     # 그래도 cold-boot/motor stuck 대비 PC 재시도는 남겨둔다.
-                    'init_attempts': 5,            # 첫 시도 깨끗하면 1회로 끝, 보험으로 5회
-                    'init_timeout_sec': 20.0,      # DRL 내부 24×0.5s=12s + serial reset 여유 → 20s면 충분
-                    'init_retry_delay_sec': 1.0,   # 빠른 재시도 (DRL 측 정리 시간 1초면 충분)
+                    'init_attempts': 20,           # [검증] 콜드부팅 흡수 보험(토크10 × host 20회)
+                                                   #   대비한 보험. 3회로 줄였다가 final_failed 빈발 → 8회로 강화.
+                    'init_timeout_sec': 22.0,      # [검증] 토크 10회(~15s)+여유
+                                                   #   단 timeout만으론 부족 — DRL이 죽으면(reset by peer) attempts로 버틴다.
+                    'init_retry_delay_sec': 0.3,   # [검증] 빠른 반복
                 }]
             ),
             Node(

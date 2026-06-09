@@ -37,6 +37,9 @@ class GripperNode(Node):
         # 이송 전류 — 파지 후 들고 이동할 때 쓰는 낮은 전류. self-locking(기어비 1181:1)
         # 덕에 약한 전류로도 물체를 유지 → 발열·과압착 완화. (close_current로 물고 LIFT 후 전환)
         self.declare_parameter('transport_current', 150)
+        # idle 위치락 전류 — 작업 완료(IDLE) 시 현재 위치를 goal로 락 + 이 낮은 전류로 유지.
+        # Current-based 위치유지 미세토크(전류 튐/채터링)를 줄인다. self-locking이라 약해도 안 풀림.
+        self.declare_parameter('idle_current', 50)
         self.declare_parameter('profile_velocity', 1500)
         self.declare_parameter('profile_acceleration', 1000)
         self.declare_parameter('stroke_open', 0)
@@ -55,6 +58,7 @@ class GripperNode(Node):
         self.open_current = self.get_parameter('open_current').value
         self.close_current = self.get_parameter('close_current').value
         self.transport_current = self.get_parameter('transport_current').value
+        self.idle_current = self.get_parameter('idle_current').value
         self.profile_velocity = self.get_parameter('profile_velocity').value
         self.profile_acceleration = self.get_parameter('profile_acceleration').value
         self.stroke_open = self.get_parameter('stroke_open').value
@@ -99,6 +103,8 @@ class GripperNode(Node):
                             self._srv_stop, callback_group=cb)
         self.create_service(Trigger, '/gripper/hold_transport',
                             self._srv_hold_transport, callback_group=cb)
+        self.create_service(Trigger, '/gripper/hold_idle',
+                            self._srv_hold_idle, callback_group=cb)
         self.create_service(SetBool, '/gripper/enable',
                             self._srv_enable, callback_group=cb)
 
@@ -123,6 +129,9 @@ class GripperNode(Node):
             elif param.name == 'transport_current':
                 self.transport_current = param.value
                 self.get_logger().info(f"파라미터 변경: transport_current -> {param.value}")
+            elif param.name == 'idle_current':
+                self.idle_current = param.value
+                self.get_logger().info(f"파라미터 변경: idle_current -> {param.value}")
             elif param.name == 'grasp_detect_current':
                 self.grasp_detect_current = param.value
                 self.get_logger().info(f"파라미터 변경: grasp_detect_current -> {param.value}")
@@ -261,6 +270,28 @@ class GripperNode(Node):
         res.message = f"이송 전류 전환 ({self.transport_current}mA)" if res.success else "이송 전류 전환 실패"
         return res
 
+    def _srv_hold_idle(self, _, res: Trigger.Response):
+        # idle 위치락 — 현재 위치를 goal로 명시(락) + idle_current(낮음)로 유지.
+        # Current-based 위치유지 미세토크(전류 튐)를 완화. self-locking이라 약해도 위치 유지.
+        with self._lock:
+            state = self._last_state
+        if state is None:
+            res.success = False
+            res.message = 'idle 위치락 실패 — 그리퍼 상태 미수신'
+            return res
+        pos = int(state.present_position)
+        profile_req = SetMotionProfile.Request()
+        profile_req.goal_current = self.idle_current
+        profile_req.profile_velocity = self.profile_velocity
+        profile_req.profile_acceleration = self.profile_acceleration
+        self._call_service(self._cli_set_profile, profile_req, "set_motion_profile(idle)")
+        pos_req = SetPosition.Request()
+        pos_req.position = pos
+        pos_res = self._call_service(self._cli_set_position, pos_req, "set_position(idle_hold)")
+        res.success = bool(pos_res and pos_res.success)
+        res.message = f'idle 위치락 (pos={pos}, {self.idle_current}mA)' if res.success else 'idle 위치락 실패'
+        return res
+
     def _srv_close(self, _, res: Trigger.Response):
         # 닫기 명령만 전송한다. 파지 성공/실패 판정은 상위(pick_place)가 LIFT 후
         # 위치로 결정한다(설계안 v2). close 순간의 지터·통신노이즈에 휘둘리던
@@ -288,24 +319,6 @@ class GripperNode(Node):
         res.success = bool(res_torque and res_torque.success)
         res.message = f"{label} 완료" if res.success else f"{label} 실패"
         return res
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 타 노드 호출용 퍼블릭 메서드 (호환성 유지)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    def grip_cube(self) -> bool:
-        ok, msg = self._move(self.stroke_close, self.close_current)
-        self.get_logger().info(f"grip_cube -> {msg}")
-        return ok
-
-    def release(self) -> bool:
-        ok, msg = self._move(self.stroke_open, self.open_current)
-        self.get_logger().info(f"release -> {msg}")
-        return ok
-
-    def move_stroke(self, stroke: int, current: int | None = None) -> bool:
-        ok, _ = self._move(stroke, current or self.open_current)
-        return ok
 
     def shutdown_safe(self, executor, timeout_sec: float = 2.0):
         """종료 시 토크를 끈다(best-effort).

@@ -98,6 +98,7 @@ rh_p12_rna_gripper:
     open_current: 200           # 열기 전류 한계 — open 직전 goal_current 급등(물체 압착) 방지 위해 낮춤
     close_current: 200          # 닫기/파지 전류 한계 (구 cube_current)
     transport_current: 80      # 이송 전류 — 파지 후 들고 이동 시 (낮으면 발열↓, 너무 낮으면 이송 중 낙하)
+    idle_current: 50            # idle 위치락 전류 — 작업완료(IDLE) 시 현재위치 락+낮은전류로 유지 (전류 튐 완화)
     # --- 모터 속도/가속도 프로파일 ---
     profile_velocity: 1500      # 구동 속도(레지스터 280). 너무 높이면 물체 접촉 시 과부하 위험
     profile_acceleration: 1000  # 구동 가속도(레지스터 278)
@@ -126,7 +127,7 @@ pick_place_gui:
     workspace_y_max: 0.60
     workspace_z_min: 0.0
     workspace_z_max: 0.60
-    reach_radius_max: 0.80
+    reach_radius_max: 0.65
 
 pick_place_node:
   ros__parameters:
@@ -150,6 +151,12 @@ pick_place_node:
     # 그리퍼 동작 완료 후 다음 로봇 모션이 시작됩니다.
     gripper_wait_sec: 1.7           # 그리퍼 동작 대기 시간 (s)
 
+    # --- LIFT 후 파지 판정 경계 (그리퍼 위치 pos, 0=열림 1000=닫힘) ---
+    # 들어올린 뒤 pos로 파지 성공/실패 판정. pos<=grasp_min_pos = close 안 먹음(실패),
+    # pos>max_grip_pos = 빈손 완전닫힘(실패), 그 사이 = 파지 성공.
+    grasp_min_pos: 50               # 이하면 그리퍼가 안 닫힘(파지 실패)
+    max_grip_pos: 700               # 초과면 빈손 완전닫힘(파지 실패)
+
     # --- 물체별 파지 전류(강도) (mA) ---
     # 파지 직전, 선택된 물체 클래스(/selected_object_class)에 따라
     # gripper_node의 close_current 파라미터를 아래 값으로 바꾼 뒤 close한다.
@@ -157,10 +164,10 @@ pick_place_node:
     # grip_class_names ↔ grip_class_currents 는 같은 순서로 1:1 대응.
     # 아래 값은 현장 튜닝 시작값 — 실기에서 물체별로 미끄러짐/손상 보며 조정할 것.
     # 강성 기준 추정 시작값. 봉지/웨하스 등 잘 찌그러지는 것은 낮게, 캔/병/박스 등 단단한 것은 높게.
-    grip_current_default: 200
+    grip_current_default: 100
     grip_class_names: ["ramen", "pack", "ssnack", "bsnack", "water", "jelly", "box", "can", "boxsnack", "wafers"]
-    grip_class_currents: [150, 200, 150, 120, 180, 150, 180, 200, 150, 150]
-    grip_current_min: 100           # 안전 clamp 하한
+    grip_class_currents: [100, 100, 150, 100, 100, 100, 100, 100, 100, 100]
+    grip_current_min: 80            # 안전 clamp 하한 (free-run ~68mA보단 위, 그 아래는 파지감지 불안정)
     grip_current_max: 500           # 안전 clamp 상한
 
     # 격리 토글 — false로 두면 close 직전 SetParameters 호출 우회 (이전 세션 동작).
@@ -172,6 +179,8 @@ pick_place_node:
     # TCP가 이 높이(base_link 기준, m) 아래로는 절대 못 내려가게 _move_to_cart에서 강제 클램프.
     # 0.0 = base_link 평면(클램프 사실상 비활성). 실제 테이블/지그 높이에 맞춰 올려서 충돌 방지.
     min_safe_z: 0.005
+    gripper_close_len: 0.145        # 그리퍼 close 시 flange→손끝 길이(m). min_safe_z(손끝 최저)를 flange 좌표로 환산용. calibration과 무관.
+    reach_radius_max: 0.65          # movel 하드 차단 평면반경(m). pick_place_gui와 동일 유지. 범위밖은 movel 미전송.
 
     # --- Pick 파라미터 ---
     pre_pick_z_offset: 0.14         # Pick 위 대기 높이 오프셋 (m)
